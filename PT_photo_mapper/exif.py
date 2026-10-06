@@ -67,11 +67,6 @@ def camera_params(path):
     focal = _to_float(exif.get("FocalLength"))
     focal35 = _to_float(exif.get("FocalLengthIn35mmFilm"))
 
-def camera_params(path):
-    exif = read_exif(path)
-    focal = _to_float(exif.get("FocalLength"))
-    focal35 = _to_float(exif.get("FocalLengthIn35mmFilm"))
-
     sensor = None
     known = sensor_from_model(exif.get("Model"))
     if known is not None:
