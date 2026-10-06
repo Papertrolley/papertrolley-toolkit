@@ -2,13 +2,16 @@ import math
 import os
 import bmesh
 import numpy as np
-from mathutils import Vector
+import json
+import logging
+from datetime import datetime
+from mathutils import Vector, Matrix
 
 import bpy as bpy
 from bpy_extras.object_utils import world_to_camera_view
 from bpy_extras.view3d_utils import region_2d_to_vector_3d
 
-from .exif import camera_params
+from .exif import camera_params, read_exif, to_float
 
 
 DEFAULT_LENS_MM = 50.0
@@ -42,6 +45,172 @@ _POSITION_LABEL = {
     'TOP':   "сверху (+Z)",
 }
 
+_logger = None
+
+def get_logger():
+    global _logger
+    if _logger is None:
+        _logger = logging.getLogger("pba_vm")
+        _logger.setLevel(logging.DEBUG)
+        if not _logger.handlers:
+            h = logging.StreamHandler()
+            h.setFormatter(logging.Formatter("[PBA VM] %(message)s"))
+            _logger.addHandler(h)
+    return _logger
+
+def _build_json_data(scene, path, W, H, cam_obj):
+    pba = scene.pba_vm
+
+    try:
+        exif = read_exif(path)
+    except Exception:
+        exif = {}
+    focal_exif = to_float(exif.get("FocalLength"))
+    focal35_exif = to_float(exif.get("FocalLengthIn35mmFilm"))
+
+    m = cam_obj.matrix_world
+    matrix_flat = [float(m[i][j]) for i in range(4) for j in range(4)]
+
+    corrs_data = []
+    for i, c in enumerate(pba.correspondences):
+        corrs_data.append({
+            "index": i,
+            "obj": c.obj_name,
+            "vertex": int(c.vertex_index),
+            "x3d": [float(c.x3d[0]), float(c.x3d[1]), float(c.x3d[2])],
+            "x2d": [float(c.x2d[0]), float(c.x2d[1])],
+            "enabled": bool(c.enabled),
+            "last_error_px": float(c.last_error),
+        })
+
+    active = [c for c in pba.correspondences if c.enabled]
+    errors = [c.last_error for c in active if c.last_error >= 0.0]
+    if errors:
+        errors_sorted = sorted(errors)
+        median_err = errors_sorted[len(errors_sorted) // 2]
+        max_err = max(errors)
+        rmse = float(np.sqrt(sum(e * e for e in errors) / len(errors)))
+    else:
+        median_err = 0.0
+        max_err = 0.0
+        rmse = 0.0
+
+    return {
+        "format_version": "1.0",
+        "generator": "PBA Vertex Mapper 0.3.0",
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "photo": {
+            "path": path,
+            "filename": os.path.basename(path),
+            "width_px": int(W),
+            "height_px": int(H),
+        },
+        "camera": {
+            "name": cam_obj.name,
+            "lens_mm": float(cam_obj.data.lens),
+            "sensor_width_mm": float(cam_obj.data.sensor_width),
+            "crop_factor": float(pba.crop_factor),
+            "exif_focal_length_mm":
+                float(focal_exif) if focal_exif else 0.0,
+            "exif_focal_length_35mm":
+                float(focal35_exif) if focal35_exif else 0.0,
+            "matrix_world": matrix_flat,
+        },
+        "solve": {
+            "f_px": float(pba.last_f_px),
+            "k1": float(pba.last_k1),
+            "k2": float(pba.last_k2),
+            "use_distortion_k1": bool(pba.use_distortion_k1),
+            "use_distortion_k2": bool(pba.use_distortion_k2),
+            "huber_delta": float(pba.huber_delta),
+            "rmse_px": rmse,
+            "median_err_px": float(median_err),
+            "max_err_px": float(max_err),
+            "n_active": len(active),
+            "n_total": len(pba.correspondences),
+        },
+        "correspondences": corrs_data,
+    }
+
+
+def _apply_json_data(scene, data, path, W, H, cam_obj):
+    logger = get_logger()
+    pba = scene.pba_vm
+
+    photo_info = data.get("photo", {})
+    json_W = int(photo_info.get("width_px", 0))
+    json_H = int(photo_info.get("height_px", 0))
+    if (json_W, json_H) != (W, H):
+        msg = (f"Размер фото в JSON {json_W}×{json_H}, "
+               f"загружено {W}×{H}")
+        logger.warning(msg)
+        _set_status(scene, msg + " — пропуск восстановления")
+        return False
+
+    cam_info = data.get("camera", {})
+    lens = float(cam_info.get("lens_mm", 0.0))
+    sensor = float(cam_info.get("sensor_width_mm", 0.0))
+    if lens > 0:
+        cam_obj.data.lens = lens
+    if sensor > 0:
+        cam_obj.data.sensor_width = sensor
+
+    m_flat = cam_info.get("matrix_world", [])
+    if len(m_flat) == 16:
+        rows = [m_flat[0:4], m_flat[4:8],
+                m_flat[8:12], m_flat[12:16]]
+        try:
+            cam_obj.matrix_world = Matrix(rows)
+        except Exception as e:
+            logger.warning(f"Не удалось восстановить matrix_world: {e}")
+
+    solve = data.get("solve", {})
+    pba.last_f_px = float(solve.get("f_px", 0.0))
+    pba.last_k1 = float(solve.get("k1", 0.0))
+    pba.last_k2 = float(solve.get("k2", 0.0))
+    pba.use_distortion = bool(solve.get("use_distortion", False))
+    pba.use_k2 = bool(solve.get("use_k2", False))
+    pba.huber_delta = float(solve.get("huber_delta", 0.0))
+
+    pba.correspondences.clear()
+    restored = 0
+    skipped = 0
+    for cd in data.get("correspondences", []):
+        obj_name = cd.get("obj", "")
+        vertex_idx = int(cd.get("vertex", -1))
+        obj = scene.objects.get(obj_name)
+        if obj is None or obj.type != 'MESH':
+            logger.warning(f"Пропуск: объект '{obj_name}' не найден")
+            skipped += 1
+            continue
+        if vertex_idx < 0 or vertex_idx >= len(obj.data.vertices):
+            logger.warning(f"Пропуск: вершина {vertex_idx} вне "
+                           f"диапазона объекта '{obj_name}'")
+            skipped += 1
+            continue
+
+        c = pba.correspondences.add()
+        c.obj_name = obj_name
+        c.vertex_index = vertex_idx
+        x3d = cd.get("x3d", [0.0, 0.0, 0.0])
+        c.x3d[0] = float(x3d[0])
+        c.x3d[1] = float(x3d[1])
+        c.x3d[2] = float(x3d[2])
+        x2d = cd.get("x2d", [0.0, 0.0])
+        c.x2d[0] = float(x2d[0])
+        c.x2d[1] = float(x2d[1])
+        c.enabled = bool(cd.get("enabled", True))
+        c.last_error = float(cd.get("last_error_px", -1.0))
+        restored += 1
+
+    rmse = float(solve.get("rmse_px", 0.0))
+    msg = (f"Восстановлено: {restored} пар"
+           + (f", пропущено {skipped}" if skipped else "")
+           + (f", RMSE {rmse:.2f}px" if rmse > 0 else ""))
+    _set_status(scene, msg)
+    logger.info(msg)
+    return True
+
 
 def _set_status(scene, msg):
     scene.pba_vm.status_msg = msg
@@ -62,6 +231,26 @@ def _delete_old_camera(scene):
         if data.users == 0:
             bpy.data.cameras.remove(data)
 
+def _sync_x3d_from_mesh(scene):
+    """Обновляет x3d каждой пары из текущего положения вершин меша."""
+    pba = scene.pba_vm
+    updated = 0
+    for c in pba.correspondences:
+        obj = scene.objects.get(c.obj_name)
+        if obj is None or obj.type != 'MESH':
+            continue
+        if c.vertex_index < 0 or c.vertex_index >= len(obj.data.vertices):
+            continue
+        v = obj.data.vertices[c.vertex_index]
+        p_world = obj.matrix_world @ v.co
+        if (abs(c.x3d[0] - p_world.x) > 1e-9
+                or abs(c.x3d[1] - p_world.y) > 1e-9
+                or abs(c.x3d[2] - p_world.z) > 1e-9):
+            c.x3d[0] = p_world.x
+            c.x3d[1] = p_world.y
+            c.x3d[2] = p_world.z
+            updated += 1
+    return updated
 
 class PBA_VM_OT_load_photo(bpy.types.Operator):
     bl_idname = "pba_vm.load_photo"
@@ -144,6 +333,19 @@ class PBA_VM_OT_load_photo(bpy.types.Operator):
             o.select_set(False)
         cam_obj.select_set(True)
         context.view_layer.objects.active = cam_obj
+        
+        # Восстановление из JSON (если есть и разрешено)
+        if scene.pba_vm.restore_from_json:
+            json_path = os.path.splitext(path)[0] + ".vertices.json"
+            if os.path.exists(json_path):
+                try:
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    _apply_json_data(scene, data, path,
+                                     img.size[0], img.size[1], cam_obj)
+                except Exception as e:
+                    self.report({'WARNING'}, f"Ошибка чтения JSON {json_path}: {e}")
+                    _set_status(scene, f"Ошибка JSON: {e}")
 
         _set_status(
             scene,
@@ -212,12 +414,17 @@ class PBA_VM_OT_save_vertices(bpy.types.Operator):
         total = 0
         in_frame_count = 0
         visible_count = 0
+        
+        n = _sync_x3d_from_mesh(scene)
+        if n > 0:
+            print(f"[PBA VM] синхронизировано {n} 3D-координат")
 
+        # CSV (как раньше, для совместимости с transfer.py)
+        csv_path = os.path.join(out_dir, f"{base}.vertices.csv")
         try:
-            with open(out_path, 'w', encoding='utf-8') as f:
+            with open(csv_path, 'w', encoding='utf-8') as f:
                 f.write("object,vertex,x_px,y_px,z_depth,"
                         "in_frame,visible\n")
-
                 for obj in scene.objects:
                     if obj.type != 'MESH':
                         continue
@@ -267,16 +474,24 @@ class PBA_VM_OT_save_vertices(bpy.types.Operator):
                             f"{in_frame},{visible}\n")
                         total += 1
         except Exception as e:
-            _set_status(scene, f"Ошибка записи: {e}")
-            self.report({'ERROR'}, f"Ошибка записи: {e}")
+            _set_status(scene, f"Ошибка записи CSV: {e}")
+            self.report({'ERROR'}, f"CSV: {e}")
             return {'CANCELLED'}
 
+        # JSON (новый формат)
+        json_path = os.path.join(out_dir, f"{base}.vertices.json")
+        try:
+            json_data = _build_json_data(scene, path, W, H, cam_obj)
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(json_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            _set_status(scene, f"Ошибка записи JSON: {e}")
+            self.report({'ERROR'}, f"JSON: {e}")
+            return {'CANCELLED'}
         _set_status(
             scene,
-            f"Сохранено: {out_path} | вершин {total}, "
-            f"в кадре {in_frame_count}, видимых {visible_count}")
-        self.report({'INFO'},
-                    f"CSV: {out_path} (видимых: {visible_count})")
+            f"Сохранено: {csv_path} и {json_path} (вершин: {total})")
+        self.report({'INFO'}, f"CSV + JSON: {base}")
         return {'FINISHED'}
 
 
@@ -506,6 +721,10 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
             (f"÷crop={crop:.2f}", base_f_px / crop),
         ]
 
+        n = _sync_x3d_from_mesh(scene)
+        if n > 0:
+            print(f"[PBA VM] синхронизировано {n} 3D-координат")
+
         world_pts = [np.array(c.x3d) for c in corrs]
         pixel_pts = [np.array(c.x2d) for c in corrs]
 
@@ -605,7 +824,11 @@ class PBA_VM_OT_diagnose_pairs(bpy.types.Operator):
             self.report({'ERROR'}, "Нет активной камеры")
             return {'CANCELLED'}
 
+        n = _sync_x3d_from_mesh(scene)
+        if n > 0:
+            print(f"[PBA VM] синхронизировано {n} 3D-координат")
         pba = scene.pba_vm
+        
         corrs = [c for c in pba.correspondences if c.enabled]
         # Отключённые — сброс ошибки
         for c in pba.correspondences:
@@ -867,10 +1090,264 @@ class PBA_VM_OT_enable_all(bpy.types.Operator):
         if len(pba.correspondences) >= 6 and scene.camera is not None:
             bpy.ops.pba_vm.solve_camera()
         return {'FINISHED'}
+
+class PBA_VM_OT_select_correspondence(bpy.types.Operator):
+    bl_idname = "pba_vm.select_correspondence"
+    bl_label = "Select Correspondence Vertex"
+    bl_description = "Выделить соответствующую вершину на 3D-модели"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        import bmesh
+        scene = context.scene
+        pba = scene.pba_vm
+
+        if not (0 <= self.index < len(pba.correspondences)):
+            return {'CANCELLED'}
+        c = pba.correspondences[self.index]
+
+        obj = scene.objects.get(c.obj_name)
+        if obj is None or obj.type != 'MESH':
+            self.report({'WARNING'},
+                        f"Объект '{c.obj_name}' не найден в сцене")
+            return {'CANCELLED'}
+
+        if c.vertex_index < 0 or c.vertex_index >= len(obj.data.vertices):
+            self.report({'WARNING'},
+                        f"Вершина {c.vertex_index} вне диапазона")
+            return {'CANCELLED'}
+
+        # Выйти из Edit Mode, если там
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Снять выделение со всех объектов
+        for o in context.view_layer.objects:
+            o.select_set(False)
+
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+
+        # Войти в Edit Mode и выделить только нужную вершину
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        if c.vertex_index < len(bm.verts):
+            bm.verts[c.vertex_index].select = True
+            bm.verts.index_update()
+        bmesh.update_edit_mesh(obj.data)
+
+        # 3D-курсор — в позицию вершины
+        v = obj.data.vertices[c.vertex_index]
+        p_world = obj.matrix_world @ v.co
+        scene.cursor.location = p_world
+
+        _set_status(
+            scene,
+            f"Выделена: {c.obj_name} v{c.vertex_index} "
+            f"({p_world.x:.2f}, {p_world.y:.2f}, {p_world.z:.2f})")
+        return {'FINISHED'}
+
         
 classes += (
     PBA_VM_OT_set_enabled,
     PBA_VM_OT_disable_selected,
     PBA_VM_OT_enable_selected,
     PBA_VM_OT_enable_all,
+    PBA_VM_OT_select_correspondence
+)
+
+def _set_vertex_world(obj, vertex_index, new_world):
+    """Устанавливает мировую позицию вершины, работая через bmesh
+    в Edit Mode и через mesh data в Object Mode."""
+    import bmesh
+    co_local = obj.matrix_world.inverted() @ new_world
+    ctx = bpy.context
+    if ctx.mode == 'EDIT_MESH' and ctx.active_object == obj:
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        if vertex_index < len(bm.verts):
+            bm.verts[vertex_index].co = co_local
+            bmesh.update_edit_mesh(obj.data)
+            return True
+        return False
+    else:
+        if 0 <= vertex_index < len(obj.data.vertices):
+            obj.data.vertices[vertex_index].co = co_local
+            return True
+        return False
+
+
+def _undistort(xn, yn, k1, k2, iters=20):
+    """Обратная задача дисторсии: дано дистортированное (xn, yn),
+    найти недистортированное (xu, yu) методом неподвижной точки."""
+    xu, yu = xn, yn
+    for _ in range(iters):
+        r2 = xu * xu + yu * yu
+        fac = 1.0 + k1 * r2 + k2 * r2 * r2
+        if abs(fac) < 1e-9:
+            break
+        new_xu = xn / fac
+        new_yu = yn / fac
+        if (abs(new_xu - xu) < 1e-9 and abs(new_yu - yu) < 1e-9):
+            xu, yu = new_xu, new_yu
+            break
+        xu, yu = new_xu, new_yu
+    return xu, yu
+    
+class PBA_VM_OT_snap_to_click(bpy.types.Operator):
+    bl_idname = "pba_vm.snap_to_click"
+    bl_label = "Snap to Click"
+    bl_description = ("Сдвинуть 3D-вершину так, чтобы её проекция "
+                      "совпала с 2D-кликом. Глубина сохраняется.")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        from mathutils import Vector
+        scene = context.scene
+        pba = scene.pba_vm
+
+        if not (0 <= self.index < len(pba.correspondences)):
+            return {'CANCELLED'}
+        c = pba.correspondences[self.index]
+
+        cam = scene.camera
+        if cam is None or cam.type != 'CAMERA':
+            self.report({'ERROR'}, "Нет активной камеры")
+            return {'CANCELLED'}
+
+        obj = scene.objects.get(c.obj_name)
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, f"Объект '{c.obj_name}' не найден")
+            return {'CANCELLED'}
+        if c.vertex_index < 0 or c.vertex_index >= len(obj.data.vertices):
+            self.report({'ERROR'}, f"Вершина {c.vertex_index} вне диапазона")
+            return {'CANCELLED'}
+
+        # Размер фото и f_px
+        W, H = _get_photo_size(scene)
+        if W == 0 or H == 0:
+            self.report({'ERROR'}, "Размер фото неизвестен")
+            return {'CANCELLED'}
+
+        lens = cam.data.lens
+        sensor = cam.data.sensor_width
+        if cam.data.sensor_fit == 'VERTICAL':
+            f_px = lens / sensor * H
+        elif cam.data.sensor_fit == 'HORIZONTAL':
+            f_px = lens / sensor * W
+        else:
+            f_px = lens / sensor * max(W, H)
+
+        k1 = pba.last_k1 if pba.use_distortion_k1 else 0.0
+        k2 = pba.last_k2 if pba.use_distortion_k2 else 0.0
+
+        u_px = c.x2d[0]
+        v_px = c.x2d[1]
+        cx_px = W / 2.0
+        cy_px = H / 2.0
+
+        xn = (u_px - cx_px) / f_px
+        yn = (cy_px - v_px) / f_px   # вверх положительно
+
+        xu, yu = _undistort(xn, yn, k1, k2)
+
+        # Луч в системе камеры (Blender: X вправо, Y вверх, Z назад)
+        direction_cam = Vector((xu, yu, -1.0))
+        R_cw = cam.matrix_world.to_3x3()
+        cam_loc = cam.matrix_world.translation.copy()
+        direction_world = R_cw @ direction_cam
+        forward_world = R_cw @ Vector((0.0, 0.0, -1.0))
+
+        # Текущая позиция — берём из актуального меша
+        v = obj.data.vertices[c.vertex_index]
+        P_current = obj.matrix_world @ v.co
+
+        # Глубина по оси взгляда камеры
+        t = (P_current - cam_loc).dot(forward_world)
+        if t <= 0.0:
+            self.report({'WARNING'},
+                        "Вершина за камерой — snap невозможен")
+            return {'CANCELLED'}
+
+        P_new = cam_loc + direction_world * t
+
+        if not _set_vertex_world(obj, c.vertex_index, P_new):
+            self.report({'ERROR'}, "Не удалось изменить вершину")
+            return {'CANCELLED'}
+
+        _sync_x3d_from_mesh(scene)
+
+        shift = (P_new - P_current).length
+        _set_status(
+            scene,
+            f"Snap: {c.obj_name} v{c.vertex_index} смещена "
+            f"на {shift * 1000:.1f} мм "
+            f"→ ({P_new.x:.3f}, {P_new.y:.3f}, {P_new.z:.3f})")
+        return {'FINISHED'}
+
+
+class PBA_VM_OT_nudge_vertex(bpy.types.Operator):
+    bl_idname = "pba_vm.nudge_vertex"
+    bl_label = "Nudge Vertex"
+    bl_description = ("Сдвинуть выделенные в Edit Mode вершины "
+                      "на шаг по одной оси в мировых координатах")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    axis: bpy.props.EnumProperty(items=[
+        ('X', "X", ""), ('Y', "Y", ""), ('Z', "Z", "")])
+    direction: bpy.props.IntProperty(default=1)
+
+    def execute(self, context):
+        import bmesh
+        from mathutils import Vector
+
+        scene = context.scene
+        pba = scene.pba_vm
+        step = pba.nudge_step
+
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, "Нет активного mesh-объекта")
+            return {'CANCELLED'}
+        if context.mode != 'EDIT_MESH':
+            self.report({'ERROR'}, "Нужен Edit Mode")
+            return {'CANCELLED'}
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        selected = [v for v in bm.verts if v.select]
+        if not selected:
+            self.report({'WARNING'}, "Не выделено вершин")
+            return {'CANCELLED'}
+
+        axis_idx = {'X': 0, 'Y': 1, 'Z': 2}[self.axis]
+        world_offset = Vector((0.0, 0.0, 0.0))
+        world_offset[axis_idx] = self.direction * step
+
+        # Мировое смещение → локальное (только поворот, без трансляции)
+        R_inv = obj.matrix_world.to_3x3().inverted()
+        local_offset = R_inv @ world_offset
+
+        for v in selected:
+            v.co += local_offset
+
+        bmesh.update_edit_mesh(obj.data)
+
+        n = _sync_x3d_from_mesh(scene)
+        sign = "+" if self.direction > 0 else "-"
+        _set_status(
+            scene,
+            f"Nudge {self.axis}{sign}{step * 1000:.0f}мм: "
+            f"{len(selected)} вершин, синхронизировано {n}")
+        return {'FINISHED'}
+        
+classes += (
+    PBA_VM_OT_snap_to_click,
+    PBA_VM_OT_nudge_vertex,
 )

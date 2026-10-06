@@ -75,3 +75,8 @@ def camera_params(path):
         sensor = 36.0 * focal / focal35
 
     return focal, sensor
+
+
+def to_float(v):
+    """Публичная обёртка для конверсии EXIF-значений."""
+    return _to_float(v)

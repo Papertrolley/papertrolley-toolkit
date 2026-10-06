@@ -1,11 +1,11 @@
 bl_info = {
-    "name": "PT Photo Mapper",
-    "author": "PaperTrolley",
-    "version": (0, 2, 0),
+    "name": "PBA Vertex Mapper",
+    "author": "PaperBus",
+    "version": (0, 3, 0),
     "blender": (4, 0, 0),
-    "location": "View3D > Sidebar > PT Photo",
+    "location": "View3D > Sidebar > PBA Vertex Mapper",
     "description": "Загружает фото, настраивает камеру, сохраняет "
-                   "координаты вершин в CSV",
+                   "координаты вершин в CSV и JSON",
     "category": "Modeling",
 }
 
@@ -29,13 +29,27 @@ class PBA_VM_Props(bpy.types.PropertyGroup):
         items=[
             ('FRONT', "Front (+X)", ""),
             ('BACK',  "Back (-X)",  ""),
-            ('LEFT', "Left (+Y)", ""),
-            ('RIGHT',  "Right (-Y)",  ""),
+            ('RIGHT', "Right (+Y)", ""),
+            ('LEFT',  "Left (-Y)",  ""),
             ('TOP',   "Top (+Z)",   ""),
         ],
         default='FRONT')
     visibility_check: bpy.props.BoolProperty(default=True)
+    restore_from_json: bpy.props.BoolProperty(
+        name="Восстанавливать из JSON",
+        description="Если рядом с фото есть .vertices.json — "
+                    "восстановить камеру и пары",
+        default=True)
     status_msg: bpy.props.StringProperty(default="")
+
+    # Solve-параметры
+    crop_factor: bpy.props.FloatProperty(default=1.53, min=1.0, max=8.0)
+    use_distortion_k1: bpy.props.BoolProperty(default=False)
+    use_distortion_k2: bpy.props.BoolProperty(default=False)
+    huber_delta: bpy.props.FloatProperty(default=0.0, min=0.0, max=100.0)
+    last_f_px: bpy.props.FloatProperty(default=0.0)
+    last_k1: bpy.props.FloatProperty(default=0.0)
+    last_k2: bpy.props.FloatProperty(default=0.0)
 
     # Соответствия
     correspondences: bpy.props.CollectionProperty(
@@ -46,26 +60,11 @@ class PBA_VM_Props(bpy.types.PropertyGroup):
     pending_3d_vertex: bpy.props.IntProperty(default=-1)
     pending_3d_set: bpy.props.BoolProperty(default=False)
     pending_2d_set: bpy.props.BoolProperty(default=False)
-    use_distortion_k1: bpy.props.BoolProperty(
-        name="Учитывать дисторсию - K1",
-        description="Добавить k1 в оптимизацию (+1 параметр)",
-        default=False)
-    use_distortion_k2: bpy.props.BoolProperty(
-        name="Учитывать дисторсию - K2",
-        description="Добавить k2 в оптимизацию (+1 параметр)",
-        default=False)
-    last_k1: bpy.props.FloatProperty(default=0.0)
-    last_k2: bpy.props.FloatProperty(default=0.0)
-    last_f_px: bpy.props.FloatProperty(default=0.0)
-    crop_factor: bpy.props.FloatProperty(
-        name="Crop factor",
-        description="Кроп-фактор камеры (1.53 для APS-C Nikon)",
-        default=1.53, min=1.0, max=8.0)
-    huber_delta: bpy.props.FloatProperty(
-        name="Huber delta (px)",
-        description="Порог Huber loss: ошибки больше этого значения "
-                    "даунвейтятся. 0 — выключено.",
-        default=8.0, min=0.0, max=100.0)
+    
+    nudge_step: bpy.props.FloatProperty(
+    name="Шаг, м",
+    description="На сколько метров двигать вершины по одной оси",
+    default=0.01, min=0.001, max=1.0)
 
 
 classes = (PBA_VM_Correspondence, PBA_VM_Props) + ops.classes + panel.classes

@@ -16,6 +16,7 @@ class PBA_VM_PT_main(bpy.types.Panel):
         box = layout.box()
         box.label(text="Photo", icon='IMAGE_DATA')
         box.prop(pba, "photo_path", text="")
+        box.prop(pba, "restore_from_json", text="Restore from JSON")
 
         box = layout.box()
         box.label(text="Camera Start", icon='CAMERA_DATA')
@@ -65,6 +66,14 @@ class PBA_VM_PT_main(bpy.types.Panel):
                 else:
                     icon = 'ERROR'
 
+                op_sel = row.operator("pba_vm.select_correspondence",
+                                   text="", icon='ZOOM_SELECTED')
+                op_sel.index = i
+
+                op_snap = row.operator("pba_vm.snap_to_click",
+                                    text="", icon='SNAP_VERTEX')
+                op_snap.index = i
+
                 label = f"{i+1}. {c.obj_name} v{c.vertex_index} → " \
                         f"({c.x2d[0]:.0f}, {c.x2d[1]:.0f})"
                 row.label(text=label, icon=icon)
@@ -94,6 +103,35 @@ class PBA_VM_PT_main(bpy.types.Panel):
 
         box.operator("pba_vm.clear_pairs", text="Clear All", icon='TRASH')
         box.operator("pba_vm.enable_all", text="Enable All", icon='RESTRICT_VIEW_OFF')
+
+        # Nudge
+        box = layout.box()
+        box.label(text="Nudge (Edit Mode)", icon='ARROW_LEFTRIGHT')
+        box.prop(pba, "nudge_step", text="Шаг, м")
+
+        row = box.row(align=True)
+        op = row.operator("pba_vm.nudge_vertex", text="−X")
+        op.axis = 'X'
+        op.direction = -1
+        op = row.operator("pba_vm.nudge_vertex", text="+X")
+        op.axis = 'X'
+        op.direction = 1
+
+        row = box.row(align=True)
+        op = row.operator("pba_vm.nudge_vertex", text="−Y")
+        op.axis = 'Y'
+        op.direction = -1
+        op = row.operator("pba_vm.nudge_vertex", text="+Y")
+        op.axis = 'Y'
+        op.direction = 1
+
+        row = box.row(align=True)
+        op = row.operator("pba_vm.nudge_vertex", text="−Z")
+        op.axis = 'Z'
+        op.direction = -1
+        op = row.operator("pba_vm.nudge_vertex", text="+Z")
+        op.axis = 'Z'
+        op.direction = 1
 
         box = layout.box()
         box.label(text="Status", icon='INFO')
