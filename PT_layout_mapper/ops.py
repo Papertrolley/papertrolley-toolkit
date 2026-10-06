@@ -12,6 +12,8 @@ from bpy_extras.view3d_utils import (region_2d_to_origin_3d,
 
 PLANE_MESH_NAME = "PBA_LayoutMesh"
 PLANE_MAT_NAME = "PBA_LayoutMat"
+PENDING_OBJ_NAME = "PBA_LM_Pending"
+COMMITTED_OBJ_NAME = "PBA_LM_Committed"
 
 
 def _set_status(scene, msg):
@@ -34,6 +36,253 @@ def _get_layout_image(scene):
     if not name:
         return None
     return bpy.data.images.get(name)
+    
+    
+_IMAGE_CACHE = {}
+
+
+def _get_image_cached(image):
+    """Кэш пикселей: (gray_uint8, rgba_float32, W, H)."""
+    key = (image.name, tuple(image.size))
+    if key in _IMAGE_CACHE:
+        return _IMAGE_CACHE[key]
+
+    W, H = image.size
+    if W == 0 or H == 0:
+        return None
+
+    import numpy as np
+    n = W * H * 4
+    buf = np.empty(n, dtype=np.float32)
+    image.pixels.foreach_get(buf)
+    rgba = buf.reshape((H, W, 4))[::-1].copy()  # flip: Blender снизу вверх
+
+    gray = (rgba[..., 0] * 0.299
+            + rgba[..., 1] * 0.587
+            + rgba[..., 2] * 0.114) * 255.0
+    gray = gray.astype(np.uint8)
+
+    result = (gray, rgba, W, H)
+    _IMAGE_CACHE[key] = result
+    return result
+
+
+def _snap_to_line(gray, px, py, radius, threshold):
+    """Возвращает (x, y, snapped) — координаты ближайшей линии."""
+    import numpy as np
+
+    H, W = gray.shape
+    x0 = max(0, int(px - radius))
+    x1 = min(W, int(px + radius + 1))
+    y0 = max(0, int(py - radius))
+    y1 = min(H, int(py + radius + 1))
+    if x1 <= x0 or y1 <= y0:
+        return px, py, False
+
+    window = gray[y0:y1, x0:x1].astype(np.float32)
+
+    # Вес: темнее пиксель — больше вес, обрезаем по порогу
+    weights = np.maximum(0.0, threshold - window)
+
+    # Дополнительно взвешиваем по близости к клику
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    d2 = (xx - px) ** 2 + (yy - py) ** 2
+    proximity = np.exp(-d2 / (radius ** 2))
+
+    total = (weights * proximity).sum()
+    if total < 1e-6:
+        return px, py, False
+
+    sx = ((weights * proximity) * xx).sum() / total
+    sy = ((weights * proximity) * yy).sum() / total
+    return float(sx), float(sy), True
+
+
+def _find_marker(rgba, px, py, radius, tolerance):
+    """Находит кластер пикселей ~#FF00FF, ближайший к клику.
+    Возвращает центр этого кластера или None."""
+    import numpy as np
+
+    H, W = rgba.shape[:2]
+    x0 = max(0, int(px - radius))
+    x1 = min(W, int(px + radius + 1))
+    y0 = max(0, int(py - radius))
+    y1 = min(H, int(py + radius + 1))
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    window = rgba[y0:y1, x0:x1, :3].astype(np.float32)
+    target = np.array([1.0, 0.0, 1.0], dtype=np.float32)
+    dist = np.sqrt(((window - target) ** 2).sum(axis=-1))
+    mask = dist < tolerance
+    if not mask.any():
+        return None
+
+    h, w = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+
+    # Ищем кластеры через BFS (4-связность достаточно)
+    cx_click = px - x0
+    cy_click = py - y0
+    best = None
+    best_d2 = float('inf')
+
+    for iy in range(h):
+        for ix in range(w):
+            if not mask[iy, ix] or visited[iy, ix]:
+                continue
+            stack = [(iy, ix)]
+            visited[iy, ix] = True
+            pixels = []
+            while stack:
+                cy, cx = stack.pop()
+                pixels.append((cy, cx))
+                if cy > 0 and mask[cy - 1, cx] and not visited[cy - 1, cx]:
+                    visited[cy - 1, cx] = True
+                    stack.append((cy - 1, cx))
+                if cy < h - 1 and mask[cy + 1, cx] and not visited[cy + 1, cx]:
+                    visited[cy + 1, cx] = True
+                    stack.append((cy + 1, cx))
+                if cx > 0 and mask[cy, cx - 1] and not visited[cy, cx - 1]:
+                    visited[cy, cx - 1] = True
+                    stack.append((cy, cx - 1))
+                if cx < w - 1 and mask[cy, cx + 1] and not visited[cy, cx + 1]:
+                    visited[cy, cx + 1] = True
+                    stack.append((cy, cx + 1))
+
+            # Центроид кластера
+            if pixels:
+                sum_y = sum(p[0] for p in pixels)
+                sum_x = sum(p[1] for p in pixels)
+                n = len(pixels)
+                cyc = sum_y / n
+                cxc = sum_x / n
+                d2 = (cxc - cx_click) ** 2 + (cyc - cy_click) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best = (x0 + cxc, y0 + cyc)
+
+    return best
+
+
+def _snap_to_features(gray, rgba, px, py, radius, threshold, tolerance):
+    """Возвращает (x, y, mode) с mode ∈ {'marker','line','none'}."""
+    marker = _find_marker(rgba, px, py, radius, tolerance)
+    if marker is not None:
+        return marker[0], marker[1], 'marker'
+
+    lx, ly, snapped = _snap_to_line(gray, px, py, radius, threshold)
+    if snapped:
+        return lx, ly, 'line'
+
+    return px, py, 'none'
+    
+
+def _pixel_to_world(plane, px, py, W_px, H_px):
+    """Пиксель выкройки → мировая точка на плоскости."""
+    from mathutils import Vector
+    if W_px <= 0 or H_px <= 0:
+        return None
+    u = px / W_px
+    v = 1.0 - py / H_px
+
+    xs = [vtx.co.x for vtx in plane.data.vertices]
+    zs = [vtx.co.z for vtx in plane.data.vertices]
+    hw = (max(xs) - min(xs)) / 2.0
+    hh = (max(zs) - min(zs)) / 2.0
+
+    local = Vector((u * 2 * hw - hw, 0.0, v * 2 * hh - hh))
+    return plane.matrix_world @ local
+
+
+def _ensure_visual_obj(scene, name):
+    obj = scene.objects.get(name)
+    if obj is not None and obj.type == 'MESH':
+        return obj
+    mesh = bpy.data.meshes.new(name + "_mesh")
+    obj = bpy.data.objects.new(name, mesh)
+    scene.collection.objects.link(obj)
+    obj.display_type = 'WIRE'
+    obj.hide_render = True
+    # Тонкая настройка, чтобы не мешать работе
+    obj.show_in_front = True
+    return obj
+
+
+def _rebuild_pending_mesh(scene):
+    """Перестраивает outline текущего набираемого квада."""
+    plane = _get_plane(scene)
+    img = _get_layout_image(scene)
+    pba = scene.pba_lm
+    if plane is None or img is None:
+        return
+
+    W, H = img.size
+    obj = _ensure_visual_obj(scene, PENDING_OBJ_NAME)
+    mesh = obj.data
+    mesh.clear_geometry()
+
+    n = pba.pending_px_count
+    if n <= 0:
+        return
+
+    verts = []
+    for i in range(n):
+        px = pba.pending_corners_px[i * 2]
+        py = pba.pending_corners_px[i * 2 + 1]
+        w = _pixel_to_world(plane, px, py, W, H)
+        if w is not None:
+            verts.append((w.x, w.y, w.z))
+
+    edges = [(i, i + 1) for i in range(len(verts) - 1)]
+    if len(verts) == 4:
+        edges.append((3, 0))
+
+    mesh.from_pydata(verts, edges, [])
+    mesh.update()
+
+
+def _rebuild_committed_mesh(scene):
+    """Перестраивает outline всех закоммиченных квадов."""
+    plane = _get_plane(scene)
+    img = _get_layout_image(scene)
+    pba = scene.pba_lm
+    if plane is None or img is None:
+        return
+
+    W, H = img.size
+    obj = _ensure_visual_obj(scene, COMMITTED_OBJ_NAME)
+    mesh = obj.data
+    mesh.clear_geometry()
+
+    all_verts = []
+    all_edges = []
+    for q in pba.quads:
+        px = list(q.corners_px)
+        base = len(all_verts)
+        for i in range(4):
+            w = _pixel_to_world(plane, px[i * 2], px[i * 2 + 1], W, H)
+            if w is None:
+                all_verts.append((0.0, 0.0, 0.0))
+            else:
+                all_verts.append((w.x, w.y, w.z))
+        all_edges.append((base + 0, base + 1))
+        all_edges.append((base + 1, base + 2))
+        all_edges.append((base + 2, base + 3))
+        all_edges.append((base + 3, base + 0))
+
+    mesh.from_pydata(all_verts, all_edges, [])
+    mesh.update()
+
+
+def _remove_visual_objs(scene):
+    for name in (PENDING_OBJ_NAME, COMMITTED_OBJ_NAME):
+        obj = scene.objects.get(name)
+        if obj is not None:
+            mesh = obj.data
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
 
 
 def _remove_plane(scene):
@@ -179,6 +428,8 @@ class PBA_LM_OT_load_layout(bpy.types.Operator):
             return {'CANCELLED'}
 
         _remove_plane(scene)
+        _remove_visual_objs(scene)
+        _IMAGE_CACHE.clear()
         try:
             _create_plane(scene, img, pba.plane_width_m, pba.plane_offset_m)
         except Exception as e:
@@ -296,7 +547,6 @@ class PBA_LM_OT_pick_image_points(bpy.types.Operator):
             o_loc = inv @ origin
             d_loc = inv.to_3x3() @ direction
             hit, loc, _, _ = plane.ray_cast(o_loc, d_loc)
-
             if not hit:
                 return {'RUNNING_MODAL'}
 
@@ -316,6 +566,17 @@ class PBA_LM_OT_pick_image_points(bpy.types.Operator):
             px = u * W_px
             py = (1.0 - v) * H_px
 
+            # Snap: маркер → линия → клик
+            mode = 'none'
+            if pba.snap_to_lines:
+                cached = _get_image_cached(img)
+                if cached is not None:
+                    gray, rgba, _, _ = cached
+                    px, py, mode = _snap_to_features(
+                        gray, rgba, px, py, pba.snap_radius_px,
+                        pba.snap_threshold,
+                        pba.snap_marker_tolerance)
+
             arr = list(pba.pending_corners_px)
             arr[self._clicks * 2] = px
             arr[self._clicks * 2 + 1] = py
@@ -323,12 +584,21 @@ class PBA_LM_OT_pick_image_points(bpy.types.Operator):
             pba.pending_px_count = self._clicks + 1
             self._clicks += 1
 
+            _rebuild_pending_mesh(scene)
+
+            suffix = {
+                'marker': " (маркер)",
+                'line':   " (линия)",
+                'none':   "",
+            }[mode]
             _set_status(scene,
-                        f"Точка {self._clicks}: ({px:.1f}, {py:.1f})")
+                        f"Точка {self._clicks}: "
+                        f"({px:.1f}, {py:.1f}){suffix}")
 
             if self._clicks >= 4:
-                _commit_quad(scene)
                 context.workspace.status_text_set(None)
+                _set_status(scene,
+                            "4 точки заданы. Commit Quad или Undo Last.")
                 return {'FINISHED'}
 
         return {'RUNNING_MODAL'}
@@ -376,11 +646,13 @@ class PBA_LM_OT_cancel_quad(bpy.types.Operator):
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        pba = context.scene.pba_lm
+        scene = context.scene
+        pba = scene.pba_lm
         pba.pending_corners_3d.clear()
         pba.pending_corners_px = (0.0,) * 8
         pba.pending_px_count = 0
-        _set_status(context.scene, "Текущий квад сброшен")
+        _rebuild_pending_mesh(scene)
+        _set_status(scene, "Текущий квад сброшен")
         return {'FINISHED'}
 
 
@@ -395,6 +667,7 @@ class PBA_LM_OT_remove_quad(bpy.types.Operator):
         pba = context.scene.pba_lm
         if 0 <= self.index < len(pba.quads):
             pba.quads.remove(self.index)
+        _rebuild_committed_mesh(context.scene)
         return {'FINISHED'}
 
 
@@ -407,6 +680,7 @@ class PBA_LM_OT_clear_quads(bpy.types.Operator):
         pba = context.scene.pba_lm
         pba.quads.clear()
         pba.quad_counter = 0
+        _rebuild_committed_mesh(context.scene)
         _set_status(context.scene, "Все квады удалены")
         return {'FINISHED'}
 
@@ -534,6 +808,50 @@ class PBA_LM_OT_frame_layout(bpy.types.Operator):
         _set_status(scene, "Вид переключён: Front, Ortho, Material Preview")
         return {'FINISHED'}
 
+class PBA_LM_OT_undo_last_click(bpy.types.Operator):
+    bl_idname = "pba_lm.undo_last_click"
+    bl_label = "Undo Last Click"
+    bl_description = "Убрать последний клик по выкройке"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        scene = context.scene
+        pba = scene.pba_lm
+        if pba.pending_px_count <= 0:
+            self.report({'WARNING'}, "Нет кликов для отмены")
+            return {'CANCELLED'}
+        pba.pending_px_count -= 1
+        arr = list(pba.pending_corners_px)
+        arr[pba.pending_px_count * 2] = 0.0
+        arr[pba.pending_px_count * 2 + 1] = 0.0
+        pba.pending_corners_px = tuple(arr)
+        _rebuild_pending_mesh(scene)
+        _set_status(scene,
+                    f"Отменён. Осталось {pba.pending_px_count} кликов")
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_commit_quad(bpy.types.Operator):
+    bl_idname = "pba_lm.commit_quad"
+    bl_label = "Commit Quad"
+    bl_description = "Сохранить набранный квад"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        pba = scene.pba_lm
+        if len(pba.pending_corners_3d) != 4:
+            self.report({'ERROR'}, "Нужно 4 3D-вершины")
+            return {'CANCELLED'}
+        if pba.pending_px_count != 4:
+            self.report({'ERROR'}, "Нужно 4 клика по выкройке")
+            return {'CANCELLED'}
+
+        _commit_quad(scene)
+        _rebuild_pending_mesh(scene)
+        _rebuild_committed_mesh(scene)
+        return {'FINISHED'}
+
 
 classes = (
     PBA_LM_OT_load_layout,
@@ -544,4 +862,6 @@ classes = (
     PBA_LM_OT_clear_quads,
     PBA_LM_OT_export_json,
     PBA_LM_OT_frame_layout,
+    PBA_LM_OT_undo_last_click,
+    PBA_LM_OT_commit_quad
 )

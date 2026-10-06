@@ -46,6 +46,20 @@ class PBA_LM_Props(bpy.types.PropertyGroup):
     quad_counter: bpy.props.IntProperty(default=0)
 
     status_msg: bpy.props.StringProperty(default="")
+    snap_to_lines: bpy.props.BoolProperty(
+        name="Snap к линиям",
+        description="При клике автоматически притягивать к ближайшей "
+                    "линии выкройки",
+        default=True)
+    snap_radius_px: bpy.props.IntProperty(
+        name="Радиус, px", default=15, min=3, max=60)
+    snap_threshold: bpy.props.IntProperty(
+        name="Порог яркости", default=180, min=20, max=255)
+    snap_marker_tolerance: bpy.props.FloatProperty(
+        name="Порог маркера",
+        description="Насколько близко к #FF00FF должен быть пиксель "
+                    "(0.05 — очень строго, 0.5 — лояльно)",
+        default=0.30, min=0.05, max=1.0)
 
 
 classes = ((PBA_LM_Corner3D, PBA_LM_Quad, PBA_LM_Props)

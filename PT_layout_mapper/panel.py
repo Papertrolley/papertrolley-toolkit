@@ -34,8 +34,29 @@ class PBA_LM_PT_main(bpy.types.Panel):
 
         col = box.column(align=True)
         col.operator("pba_lm.capture_3d", icon='VERTEXSEL')
-        col.operator("pba_lm.pick_image_points", icon='MOUSE_LMB')
-        box.operator("pba_lm.cancel_quad", icon='X')
+
+        row = col.row(align=True)
+        op = row.operator("pba_lm.pick_image_points",
+                          text="Pick 4 Points", icon='MOUSE_LMB')
+        row.operator("pba_lm.undo_last_click", text="", icon='LOOP_BACK')
+
+        row = box.row(align=True)
+        sub = row.row(align=True)
+        sub.enabled = (n3d == 4 and npx == 4)
+        sub.operator("pba_lm.commit_quad", text="Commit",
+                     icon='CHECKMARK')
+        row.operator("pba_lm.cancel_quad", text="Cancel", icon='X')
+
+        # Snap options
+        col = box.column(align=True)
+        col.prop(pba, "snap_to_lines")
+        sub = col.row(align=True)
+        sub.enabled = pba.snap_to_lines
+        sub.prop(pba, "snap_radius_px")
+        sub.prop(pba, "snap_threshold")
+        sub2 = col.row()
+        sub2.enabled = pba.snap_to_lines
+        sub2.prop(pba, "snap_marker_tolerance")
 
         # Quads list
         box = layout.box()
