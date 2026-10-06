@@ -20,6 +20,7 @@ class PBA_VM_Correspondence(bpy.types.PropertyGroup):
     x3d: bpy.props.FloatVectorProperty(size=3, default=(0.0, 0.0, 0.0))
     x2d: bpy.props.FloatVectorProperty(size=2, default=(0.0, 0.0))
     last_error: bpy.props.FloatProperty(default=-1.0)
+    enabled: bpy.props.BoolProperty(default=True)
 
 
 class PBA_VM_Props(bpy.types.PropertyGroup):
@@ -45,6 +46,21 @@ class PBA_VM_Props(bpy.types.PropertyGroup):
     pending_3d_vertex: bpy.props.IntProperty(default=-1)
     pending_3d_set: bpy.props.BoolProperty(default=False)
     pending_2d_set: bpy.props.BoolProperty(default=False)
+    use_distortion: bpy.props.BoolProperty(
+        name="Учитывать дисторсию",
+        description="Добавить k1 в оптимизацию (всего 7 параметров)",
+        default=True)
+    last_k1: bpy.props.FloatProperty(default=0.0)
+    last_f_px: bpy.props.FloatProperty(default=0.0)
+    crop_factor: bpy.props.FloatProperty(
+        name="Crop factor",
+        description="Кроп-фактор камеры (1.53 для APS-C Nikon)",
+        default=1.53, min=1.0, max=8.0)
+    huber_delta: bpy.props.FloatProperty(
+        name="Huber delta (px)",
+        description="Порог Huber loss: ошибки больше этого значения "
+                    "даунвейтятся. 0 — выключено.",
+        default=8.0, min=0.0, max=100.0)
 
 
 classes = (PBA_VM_Correspondence, PBA_VM_Props) + ops.classes + panel.classes

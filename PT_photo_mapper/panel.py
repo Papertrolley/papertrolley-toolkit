@@ -20,6 +20,7 @@ class PBA_VM_PT_main(bpy.types.Panel):
         box = layout.box()
         box.label(text="Camera Start", icon='CAMERA_DATA')
         box.prop(pba, "camera_position", text="")
+        box.prop(pba, "crop_factor")
 
         col = layout.column(align=True)
         col.operator("pba_vm.load_photo", icon='CAMERA_DATA')
@@ -43,40 +44,55 @@ class PBA_VM_PT_main(bpy.types.Panel):
         col = box.column(align=True)
         col.operator("pba_vm.pick_3d", icon='VERTEXSEL')
         col.operator("pba_vm.pick_2d", icon='MOUSE_LMB')
-
+        
         if pba.correspondences:
             box.separator()
+            active = sum(1 for c in pba.correspondences if c.enabled)
+            total = len(pba.correspondences)
+            box.label(text=f"Активных: {active} / {total}")
+
             for i, c in enumerate(pba.correspondences):
                 row = box.row(align=True)
-                # Цвет маркера
-                if c.last_error < 0:
+                if not c.enabled:
+                    # Отключённая пара — серая
+                    icon = 'HIDE_ON'
+                elif c.last_error < 0:
                     icon = 'RADIOBUT_OFF'
                 elif c.last_error < 5:
-                    icon = 'CHECKMARK'  # зелёный
+                    icon = 'CHECKMARK'
                 elif c.last_error < 20:
-                    icon = 'INFO'       # жёлтый
+                    icon = 'INFO'
                 else:
-                    icon = 'ERROR'      # красный
+                    icon = 'ERROR'
 
                 label = f"{i+1}. {c.obj_name} v{c.vertex_index} → " \
                         f"({c.x2d[0]:.0f}, {c.x2d[1]:.0f})"
                 row.label(text=label, icon=icon)
-                if c.last_error >= 0:
+                if c.enabled and c.last_error >= 0:
                     row.label(text=f"{c.last_error:.1f}px")
+                else:
+                    row.label(text="—")
                 op = row.operator("pba_vm.remove_pair", text="", icon='X')
                 op.index = i
 
+        # Управление
         row = box.row(align=True)
-        row.operator("pba_vm.clear_pairs", text="Clear All", icon='TRASH')
         row.operator("pba_vm.solve_camera", text="Solve", icon='CAMERA_DATA')
-        row = box.row(align=True)
         row.operator("pba_vm.diagnose_pairs", text="Diagnose", icon='VIEWZOOM')
-        row.operator("pba_vm.remove_outliers", text="Remove Outliers",
-                     icon='FILTER')
-        row = box.row(align=True)
-        row.operator("pba_vm.plot_residuals", text="Plot Residuals",
-                     icon='IMAGE_ZDEPTH')
+        row.operator("pba_vm.remove_outliers", text="Outliers", icon='FILTER')
 
+        row = box.row(align=True)
+        box.prop(pba, "use_distortion")
+        box.prop(pba, "huber_delta")
+
+        row = box.row(align=True)
+        row.operator("pba_vm.disable_selected", text="Disable Sel.",
+                     icon='HIDE_ON')
+        row.operator("pba_vm.enable_selected", text="Enable Sel.",
+                     icon='HIDE_OFF')
+
+        box.operator("pba_vm.clear_pairs", text="Clear All", icon='TRASH')
+        box.operator("pba_vm.enable_all", text="Enable All", icon='RESTRICT_VIEW_OFF')
 
         box = layout.box()
         box.label(text="Status", icon='INFO')

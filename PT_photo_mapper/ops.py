@@ -9,13 +9,12 @@ from bpy_extras.object_utils import world_to_camera_view
 from bpy_extras.view3d_utils import region_2d_to_vector_3d
 
 from .exif import camera_params
-from .solver import solve_pnp
 
 
 DEFAULT_LENS_MM = 50.0
 DEFAULT_SENSOR_MM = 36.0
 
-CAMERA_DISTANCE_M = 5.0
+CAMERA_DISTANCE_M = 10.0
 CAMERA_NAME = "PBA_VM_Camera"
 
 # Относительный допуск при сравнении расстояний. 0.1% от дистанции
@@ -23,13 +22,13 @@ CAMERA_NAME = "PBA_VM_Camera"
 VISIBILITY_EPS_REL = 1e-3
 
 _POSITIONS = {
-    'FRONT': (( CAMERA_DISTANCE_M, 0.0, 1.5),
+    'FRONT': (( CAMERA_DISTANCE_M, 0.0, 0.0),
               (math.pi / 2, 0.0,  math.pi / 2)),
-    'BACK':  ((-CAMERA_DISTANCE_M, 0.0, 1.5),
+    'BACK':  ((-CAMERA_DISTANCE_M, 0.0, 0.0),
               (math.pi / 2, 0.0, -math.pi / 2)),
-    'LEFT': ((0.0,  CAMERA_DISTANCE_M, 1.5),
+    'LEFT': ((0.0,  CAMERA_DISTANCE_M, 0.0),
               (math.pi / 2, 0.0,  math.pi)),
-    'RIGHT':  ((0.0, -CAMERA_DISTANCE_M, 1.5),
+    'RIGHT':  ((0.0, -CAMERA_DISTANCE_M, 0.0),
               (math.pi / 2, 0.0, 0.0)),
     'TOP':   ((0.0, 0.0,  CAMERA_DISTANCE_M),
               (0.0, 0.0, 0.0)),
@@ -302,11 +301,39 @@ def _commit_pair(scene):
     pba = scene.pba_vm
     if not (pba.pending_3d_set and pba.pending_2d_set):
         return
+
+    # Дубликат 3D-вершины
+    for existing in pba.correspondences:
+        if (existing.obj_name == pba.pending_3d_obj
+                and existing.vertex_index == pba.pending_3d_vertex):
+            pba.pending_3d_set = False
+            pba.pending_2d_set = False
+            pba.pending_3d_obj = ""
+            pba.pending_3d_vertex = -1
+            print(f"[PBA VM] пропущен дубликат 3D: "
+                  f"{existing.obj_name} v{existing.vertex_index}")
+            return
+
+    # Близкий 2D-клик
+    px = pba.pending_x2d[0]
+    py = pba.pending_x2d[1]
+    for existing in pba.correspondences:
+        dx = existing.x2d[0] - px
+        dy = existing.x2d[1] - py
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist < 5.0:
+            print(f"[PBA VM] ВНИМАНИЕ: 2D-клик ({px:.1f},{py:.1f}) "
+                  f"в {dist:.1f}px от пары "
+                  f"{existing.obj_name} v{existing.vertex_index} "
+                  f"({existing.x2d[0]:.1f},{existing.x2d[1]:.1f}). "
+                  f"Возможно, дубликат.")
+
     c = pba.correspondences.add()
     c.obj_name = pba.pending_3d_obj
     c.vertex_index = pba.pending_3d_vertex
     c.x3d = pba.pending_x3d
     c.x2d = pba.pending_x2d
+
     pba.pending_3d_set = False
     pba.pending_2d_set = False
     pba.pending_3d_obj = ""
@@ -450,9 +477,10 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
             self.report({'ERROR'}, "Нет активной камеры")
             return {'CANCELLED'}
 
-        corrs = scene.pba_vm.correspondences
+        corrs = [c for c in scene.pba_vm.correspondences if c.enabled]
         if len(corrs) < 6:
-            self.report({'WARNING'}, f"Нужно минимум 6 пар, у вас {len(corrs)}")
+            self.report({'WARNING'},
+                        f"Активных пар {len(corrs)}, нужно ≥6")
             return {'CANCELLED'}
 
         W, H = _get_photo_size(scene)
@@ -461,108 +489,96 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
             return {'CANCELLED'}
 
 
+        pba = scene.pba_vm
         lens = cam.data.lens
         sensor = cam.data.sensor_width
         if cam.data.sensor_fit == 'VERTICAL':
-            f_px_init = lens / sensor * H
+            base_f_px = lens / sensor * H
         elif cam.data.sensor_fit == 'HORIZONTAL':
-            f_px_init = lens / sensor * W
-        else:  # AUTO
-            f_px_init = lens / sensor * max(W, H)
+            base_f_px = lens / sensor * W
+        else:
+            base_f_px = lens / sensor * max(W, H)
+
+        crop = float(pba.crop_factor)
+        candidates = [
+            ("EXIF как есть", base_f_px),
+            (f"×crop={crop:.2f}", base_f_px * crop),
+            (f"÷crop={crop:.2f}", base_f_px / crop),
+        ]
 
         world_pts = [np.array(c.x3d) for c in corrs]
         pixel_pts = [np.array(c.x2d) for c in corrs]
 
-        from .solver import (solve_pnp, refine_focal_and_pose,
-                              geometric_refine)
+        from mathutils import Matrix
+        from .solver import pose_refine_multistart
 
-        # Шаг 1: DLT для начального приближения
-        K_init = np.array([
-            [f_px_init, 0.0, W / 2.0],
-            [0.0, f_px_init, H / 2.0],
-            [0.0, 0.0, 1.0],
-        ])
-        M_dlt = solve_pnp(world_pts, pixel_pts, K_init)
+        M_init = np.array(cam.matrix_world)
 
-        # Шаг 2: grid search по фокусному
-        M_grid, f_px_grid, rmse_grid = refine_focal_and_pose(
-            world_pts, pixel_pts, W, H, f_px_init)
+        print(f"[PBA solve] focal={lens:.2f}mm, sensor={sensor:.2f}mm, "
+              f"точек={len(world_pts)}, "
+              f"дисторсия={'вкл' if pba.use_distortion else 'выкл'}, "
+              f"crop={crop:.3f}")
+        print(f"[PBA solve] base_f_px = {base_f_px:.1f}")
 
-        if M_grid is None:
-            self.report({'ERROR'}, "PnP не сошёлся")
+        best = None
+        for name, f_px_try in candidates:
+            M_best, rmse, k1 = pose_refine_multistart(
+                world_pts, pixel_pts, W, H, f_px_try, M_init,
+                use_distortion=pba.use_distortion,
+                huber_delta=pba.huber_delta,
+                verbose=False)
+            if M_best is None:
+                print(f"[PBA focal] {name}: LM не сошёлся")
+                continue
+            print(f"[PBA focal] {name:16s} f_px={f_px_try:8.1f}  "
+                  f"rmse={rmse:7.3f} px  k1={k1:+.4f}")
+            if best is None or rmse < best[1]:
+                best = (M_best, rmse, k1, f_px_try, name)
+
+        if best is None:
+            self.report({'ERROR'}, "LM не сошёлся ни для одного фокусного")
             return {'CANCELLED'}
 
-        # Шаг 3: geometric refinement (LM)
-        M_ref, f_px_ref, rmse_ref = geometric_refine(
-            world_pts, pixel_pts, W, H, M_grid, f_px_grid)
+        M_best, rmse, k1, f_px_used, name_used = best
+        print(f"[PBA focal] ВЫБРАНО: {name_used}, "
+              f"f_px={f_px_used:.1f}, rmse={rmse:.3f}, k1={k1:+.4f}")
 
-        if M_ref is None:
-            M_ref, f_px_ref = M_grid, f_px_grid
-            rmse_ref = rmse_grid
+        cam.matrix_world = Matrix(M_best.tolist())
+        pba.last_k1 = k1
+        pba.last_f_px = f_px_used
 
-        print(f"[PBA refine] DLT rmse: {rmse_grid:.2f} px, "
-              f"f_px = {f_px_grid:.1f}")
-        print(f"[PBA refine] LM  rmse: {rmse_ref:.2f} px, "
-              f"f_px = {f_px_ref:.1f}")
-
-        M = M_ref
-        f_px_best = f_px_ref
-
-        # Пересчитываем lens для Blender-камеры
-        if cam.data.sensor_fit == 'VERTICAL':
-            lens_new = f_px_best * sensor / H
-        elif cam.data.sensor_fit == 'HORIZONTAL':
-            lens_new = f_px_best * sensor / W
-        else:
-            lens_new = f_px_best * sensor / max(W, H)
-
-        lens_before = cam.data.lens
-        cam.data.lens = lens_new
-        cam.matrix_world = Matrix(M.tolist())
-        
-        # Диагностика ориентации
-        R = cam.matrix_world.to_3x3()
-        forward = -R.col[2]  # куда смотрит камера, в мире
-        up = R.col[1]        # верх камеры
-        right = R.col[0]
-        print(f"[PBA pose] forward: ({forward.x:.3f}, {forward.y:.3f}, {forward.z:.3f})")
-        print(f"[PBA pose] up:      ({up.x:.3f}, {up.y:.3f}, {up.z:.3f})")
-        
-
-        # Оценка ошибки после уточнения
+        cx, cy = W / 2.0, H / 2.0
         errors = []
         for c in corrs:
             co = world_to_camera_view(
                 scene, cam, Vector((c.x3d[0], c.x3d[1], c.x3d[2])))
-            px = co.x * W
-            py = (1.0 - co.y) * H
-            err = ((px - c.x2d[0]) ** 2 + (py - c.x2d[1]) ** 2) ** 0.5
+            u_px = co.x * W
+            v_px = (1.0 - co.y) * H
+            xn = (u_px - cx) / f_px_used
+            yn = (v_px - cy) / f_px_used
+            r2 = xn * xn + yn * yn
+            fac = 1.0 + k1 * r2
+            u_d = f_px_used * xn * fac + cx
+            v_d = f_px_used * yn * fac + cy
+            err = ((u_d - c.x2d[0]) ** 2 + (v_d - c.x2d[1]) ** 2) ** 0.5
+            c.last_error = err
             errors.append(err)
 
         mean_err = sum(errors) / len(errors)
         max_err = max(errors)
-        
-        for idx, c in enumerate(corrs):
-            co = world_to_camera_view(
-                scene, cam, Vector((c.x3d[0], c.x3d[1], c.x3d[2])))
-            px = co.x * W
-            py = (1.0 - co.y) * H
-            err = ((px - c.x2d[0]) ** 2 + (py - c.x2d[1]) ** 2) ** 0.5
-            c.last_error = err
-            errors.append(err)
-            
-        print("[PBA per-pair] ошибки по парам:")
+
+        print("[PBA per-pair] ошибки:")
         for idx, err in enumerate(errors):
-            flag = "  <-- выброс" if err > 2.5 * (sum(errors)/len(errors)) else ""
+            flag = "  <-- выброс" if err > 2.5 * mean_err else ""
             print(f"  pair {idx}: {err:7.2f} px{flag}")
 
+        dist_str = f" k1={k1:+.4f}" if pba.use_distortion else ""
         _set_status(
             scene,
-            f"Камера обновлена. Ошибка: средняя {mean_err:.2f}px, "
-            f"макс {max_err:.2f}px. "
-            f"Фокус: {lens_before:.1f} → {lens_new:.1f}мм")
+            f"Ошибка: средняя {mean_err:.2f}px, макс {max_err:.2f}px. "
+            f"Фокус: {name_used}.{dist_str}")
         self.report({'INFO'},
-                    f"PnP: RMSE {rmse_ref:.2f}px, lens {lens_new:.1f}мм")
+                    f"RMSE {rmse:.2f}px, фокус {name_used}")
         return {'FINISHED'}
 
 
@@ -587,9 +603,15 @@ class PBA_VM_OT_diagnose_pairs(bpy.types.Operator):
             self.report({'ERROR'}, "Нет активной камеры")
             return {'CANCELLED'}
 
-        corrs = scene.pba_vm.correspondences
+        pba = scene.pba_vm
+        corrs = [c for c in pba.correspondences if c.enabled]
+        # Отключённые — сброс ошибки
+        for c in pba.correspondences:
+            if not c.enabled:
+                c.last_error = -1.0
+
         if not corrs:
-            self.report({'WARNING'}, "Нет пар")
+            self.report({'WARNING'}, "Нет активных пар")
             return {'CANCELLED'}
 
         W, H = _get_photo_size(scene)
@@ -597,25 +619,36 @@ class PBA_VM_OT_diagnose_pairs(bpy.types.Operator):
             self.report({'ERROR'}, "Размер фото неизвестен")
             return {'CANCELLED'}
 
+        f_px = pba.last_f_px if pba.last_f_px > 0 else 1.0
+        k1 = pba.last_k1
+        cx, cy = W / 2.0, H / 2.0
+
         errors = []
         for c in corrs:
             co = world_to_camera_view(
                 scene, cam, Vector((c.x3d[0], c.x3d[1], c.x3d[2])))
-            px = co.x * W
-            py = (1.0 - co.y) * H
-            err = ((px - c.x2d[0]) ** 2 + (py - c.x2d[1]) ** 2) ** 0.5
+            u_px = co.x * W
+            v_px = (1.0 - co.y) * H
+            xn = (u_px - cx) / f_px
+            yn = (v_px - cy) / f_px
+            r2 = xn * xn + yn * yn
+            fac = 1.0 + k1 * r2
+            u_d = f_px * xn * fac + cx
+            v_d = f_px * yn * fac + cy
+            err = ((u_d - c.x2d[0]) ** 2 + (v_d - c.x2d[1]) ** 2) ** 0.5
             c.last_error = err
             errors.append(err)
 
-        mean_err = sum(errors) / len(errors)
+        errs_sorted = sorted(errors)
+        median = errs_sorted[len(errs_sorted) // 2]
         max_err = max(errors)
-        outliers = sum(1 for e in errors if e > 2.5 * mean_err)
+        outliers = sum(1 for e in errors if e > 2.5 * median)
 
         _set_status(
             scene,
-            f"Диагностика: средняя {mean_err:.2f}px, макс {max_err:.2f}px, "
-            f"выбросов: {outliers}")
-        self.report({'INFO'}, f"Средняя ошибка {mean_err:.2f}px")
+            f"Диагностика ({len(corrs)} активных): медиана {median:.2f}px, "
+            f"макс {max_err:.2f}px, выбросов: {outliers}")
+        self.report({'INFO'}, f"Медиана {median:.2f}px")
         return {'FINISHED'}
 
 
@@ -632,7 +665,6 @@ class PBA_VM_OT_remove_outliers(bpy.types.Operator):
             self.report({'WARNING'}, "Нет пар")
             return {'CANCELLED'}
 
-        # Сначала обновим ошибки
         bpy.ops.pba_vm.diagnose_pairs()
 
         errs = [c.last_error for c in pba.correspondences
@@ -644,19 +676,26 @@ class PBA_VM_OT_remove_outliers(bpy.types.Operator):
         median = errs_sorted[len(errs_sorted) // 2]
         threshold = max(median * 2.5, 5.0)
 
-        to_remove = []
-        for i, c in enumerate(pba.correspondences):
-            if c.last_error > threshold:
-                to_remove.append(i)
+        to_remove = [i for i, c in enumerate(pba.correspondences)
+                     if c.last_error > threshold]
 
-        # Удаляем с конца, чтобы индексы не сбились
         for i in reversed(to_remove):
             pba.correspondences.remove(i)
 
         _set_status(
             scene,
-            f"Удалено выбросов: {len(to_remove)} "
-            f"(порог {threshold:.1f}px, медиана {median:.1f}px)")
+            f"Удалено: {len(to_remove)} (порог {threshold:.1f}px, "
+            f"медиана {median:.1f}px). Осталось {len(pba.correspondences)} пар.")
+
+        # Автоматически пересчитать решение, если хватает пар
+        if len(pba.correspondences) >= 6:
+            bpy.ops.pba_vm.solve_camera()
+        else:
+            _set_status(
+                scene,
+                f"Удалено: {len(to_remove)}. Осталось "
+                f"{len(pba.correspondences)} пар — нужно ≥6 для решения.")
+
         return {'FINISHED'}
 
 
@@ -722,3 +761,113 @@ class PBA_VM_OT_plot_residuals(bpy.types.Operator):
 
 
 classes += (PBA_VM_OT_plot_residuals,)
+
+def _get_selected_vertex_indices(context):
+    """Возвращает (obj_name, [индексы выделенных вершин]) или (None, [])."""
+    obj = context.active_object
+    if obj is None or obj.type != 'MESH':
+        return None, []
+    if context.mode != 'EDIT_MESH':
+        return None, []
+    import bmesh
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    selected = [v.index for v in bm.verts if v.select]
+    return obj.name, selected
+
+
+class PBA_VM_OT_set_enabled(bpy.types.Operator):
+    """Общий оператор для включения/отключения выделенных пар."""
+    bl_idname = "pba_vm.set_enabled"
+    bl_label = "Set Enabled for Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    enable: bpy.props.BoolProperty(default=False)
+
+    def execute(self, context):
+        scene = context.scene
+        pba = scene.pba_vm
+
+        obj_name, selected = _get_selected_vertex_indices(context)
+        if obj_name is None:
+            self.report({'ERROR'},
+                        "Требуется Edit Mode с активным mesh-объектом")
+            return {'CANCELLED'}
+        if not selected:
+            self.report({'WARNING'}, "Не выделено ни одной вершины")
+            return {'CANCELLED'}
+
+        sel_set = set(selected)
+        changed = 0
+        for c in pba.correspondences:
+            if c.obj_name == obj_name and c.vertex_index in sel_set:
+                if c.enabled != self.enable:
+                    c.enabled = self.enable
+                    changed += 1
+
+        action = "Включено" if self.enable else "Отключено"
+        active = sum(1 for c in pba.correspondences if c.enabled)
+        _set_status(
+            scene,
+            f"{action}: {changed} пар. Активных: {active} "
+            f"из {len(pba.correspondences)}")
+
+        # Автопересчёт, если достаточно активных пар
+        if active >= 6 and scene.camera is not None:
+            bpy.ops.pba_vm.solve_camera()
+        elif active < 6:
+            _set_status(
+                scene,
+                f"{action}: {changed}. Активных {active} — "
+                f"мало для пересчёта.")
+
+        return {'FINISHED'}
+
+
+class PBA_VM_OT_disable_selected(bpy.types.Operator):
+    bl_idname = "pba_vm.disable_selected"
+    bl_label = "Disable Selected"
+    bl_description = ("Отключить из решения все пары, чьи 3D-вершины "
+                      "выделены в Edit Mode")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        return bpy.ops.pba_vm.set_enabled(enable=False)
+
+
+class PBA_VM_OT_enable_selected(bpy.types.Operator):
+    bl_idname = "pba_vm.enable_selected"
+    bl_label = "Enable Selected"
+    bl_description = ("Включить в решение все пары, чьи 3D-вершины "
+                      "выделены в Edit Mode")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        return bpy.ops.pba_vm.set_enabled(enable=True)
+
+
+class PBA_VM_OT_enable_all(bpy.types.Operator):
+    bl_idname = "pba_vm.enable_all"
+    bl_label = "Enable All"
+    bl_description = "Включить все пары"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        pba = scene.pba_vm
+        changed = 0
+        for c in pba.correspondences:
+            if not c.enabled:
+                c.enabled = True
+                changed += 1
+        _set_status(scene, f"Включено всех: {changed}")
+        if len(pba.correspondences) >= 6 and scene.camera is not None:
+            bpy.ops.pba_vm.solve_camera()
+        return {'FINISHED'}
+        
+classes += (
+    PBA_VM_OT_set_enabled,
+    PBA_VM_OT_disable_selected,
+    PBA_VM_OT_enable_selected,
+    PBA_VM_OT_enable_all,
+)
