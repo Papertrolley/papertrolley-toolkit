@@ -715,11 +715,6 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
             base_f_px = lens / sensor * max(W, H)
 
         crop = float(pba.crop_factor)
-        candidates = [
-            ("EXIF как есть", base_f_px),
-            (f"×crop={crop:.2f}", base_f_px * crop),
-            (f"÷crop={crop:.2f}", base_f_px / crop),
-        ]
 
         n = _sync_x3d_from_mesh(scene)
         if n > 0:
@@ -740,33 +735,29 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
         print(f"[PBA solve] base_f_px = {base_f_px:.1f}")
 
         best = None
-        for name, f_px_try in candidates:
-            M_best, rmse, k1, k2 = pose_refine_multistart(
-                world_pts, pixel_pts, W, H, f_px_try, M_init,
+
+        M_best, rmse, k1, k2 = pose_refine_multistart(
+                world_pts, pixel_pts, W, H, base_f_px, M_init,
                 use_distortion_k1=pba.use_distortion_k1,
                 use_distortion_k2=pba.use_distortion_k2,
                 huber_delta=pba.huber_delta,
                 verbose=False)
-            if M_best is None:
-                print(f"[PBA focal] {name}: LM не сошёлся")
-                continue
-            print(f"[PBA focal] {name:16s} f_px={f_px_try:8.1f}  "
-                  f"rmse={rmse:7.3f} px,  k1={k1:+.4f}, k2={k2:+.4f}")
-            if best is None or rmse < best[1]:
-                best = (M_best, rmse, k1, k2, f_px_try, name)
+
+        if best is None or rmse < best[1]:
+                best = (M_best, rmse, k1, k2)
 
         if best is None:
-            self.report({'ERROR'}, "LM не сошёлся ни для одного фокусного")
+            self.report({'ERROR'}, "LM не сошёлся")
             return {'CANCELLED'}
 
-        M_best, rmse, k1, k2, f_px_used, name_used = best
-        print(f"[PBA focal] ВЫБРАНО: {name_used}, "
-              f"f_px={f_px_used:.1f}, rmse={rmse:.3f}, k1={k1:+.4f}, k2={k2:+.4f}")
+        M_best, rmse, k1, k2 = best
+        print(f"[PBA solve] ПОЛУЧЕНО:"
+              f"rmse={rmse:.3f}, k1={k1:+.4f}, k2={k2:+.4f}")
 
         cam.matrix_world = Matrix(M_best.tolist())
         pba.last_k1 = k1
         pba.last_k2 = k2
-        pba.last_f_px = f_px_used
+        pba.last_f_px = base_f_px
 
         cx, cy = W / 2.0, H / 2.0
         errors = []
@@ -775,12 +766,12 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
                 scene, cam, Vector((c.x3d[0], c.x3d[1], c.x3d[2])))
             u_px = co.x * W
             v_px = (1.0 - co.y) * H
-            xn = (u_px - cx) / f_px_used
-            yn = (v_px - cy) / f_px_used
+            xn = (u_px - cx) / base_f_px
+            yn = (v_px - cy) / base_f_px
             r2 = xn * xn + yn * yn
             fac = 1.0 + k1 * r2 + k2 * r2 * r2
-            u_d = f_px_used * xn * fac + cx
-            v_d = f_px_used * yn * fac + cy
+            u_d = base_f_px * xn * fac + cx
+            v_d = base_f_px * yn * fac + cy
             err = ((u_d - c.x2d[0]) ** 2 + (v_d - c.x2d[1]) ** 2) ** 0.5
             c.last_error = err
             errors.append(err)
@@ -796,10 +787,9 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
         dist_str = f" k1={k1:+.4f}, k2={k2:+.4f}" if pba.use_distortion_k1 or pba.use_distortion_k2 else ""
         _set_status(
             scene,
-            f"Ошибка: средняя {mean_err:.2f}px, макс {max_err:.2f}px. "
-            f"Фокус: {name_used}.{dist_str}")
+            f"Ошибка: средняя {mean_err:.2f}px, макс {max_err:.2f}px. ")
         self.report({'INFO'},
-                    f"RMSE {rmse:.2f}px, фокус {name_used}")
+                    f"Ошибка: средняя {mean_err:.2f}px, макс {max_err:.2f}px. RMSE {rmse:.2f}px")
         return {'FINISHED'}
 
 

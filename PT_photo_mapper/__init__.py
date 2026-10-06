@@ -1,9 +1,9 @@
 bl_info = {
-    "name": "PBA Vertex Mapper",
-    "author": "PaperBus",
+    "name": "PT Photo Mapper",
+    "author": "PaperTrolley",
     "version": (0, 3, 0),
     "blender": (4, 0, 0),
-    "location": "View3D > Sidebar > PBA Vertex Mapper",
+    "location": "View3D > Sidebar > PT Model",
     "description": "Загружает фото, настраивает камеру, сохраняет "
                    "координаты вершин в CSV и JSON",
     "category": "Modeling",

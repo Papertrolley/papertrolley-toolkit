@@ -3,7 +3,7 @@ bl_info = {
     "author": "PaperTrolley",
     "version": (0, 1, 0),
     "blender": (4, 0, 0),
-    "location": "View3D > Sidebar > PT Layout",
+    "location": "View3D > Sidebar > PT Model",
     "description": "Разметка соответствий между 4 вершинами 3D-модели "
                    "и 4 точками на выкройке",
     "category": "Modeling",
