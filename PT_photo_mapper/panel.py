@@ -82,7 +82,8 @@ class PBA_VM_PT_main(bpy.types.Panel):
         row.operator("pba_vm.remove_outliers", text="Outliers", icon='FILTER')
 
         row = box.row(align=True)
-        box.prop(pba, "use_distortion")
+        box.prop(pba, "use_distortion_k1")
+        box.prop(pba, "use_distortion_k2")
         box.prop(pba, "huber_delta")
 
         row = box.row(align=True)

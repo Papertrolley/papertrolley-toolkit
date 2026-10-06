@@ -46,11 +46,16 @@ class PBA_VM_Props(bpy.types.PropertyGroup):
     pending_3d_vertex: bpy.props.IntProperty(default=-1)
     pending_3d_set: bpy.props.BoolProperty(default=False)
     pending_2d_set: bpy.props.BoolProperty(default=False)
-    use_distortion: bpy.props.BoolProperty(
-        name="Учитывать дисторсию",
-        description="Добавить k1 в оптимизацию (всего 7 параметров)",
-        default=True)
+    use_distortion_k1: bpy.props.BoolProperty(
+        name="Учитывать дисторсию - K1",
+        description="Добавить k1 в оптимизацию (+1 параметр)",
+        default=False)
+    use_distortion_k2: bpy.props.BoolProperty(
+        name="Учитывать дисторсию - K2",
+        description="Добавить k2 в оптимизацию (+1 параметр)",
+        default=False)
     last_k1: bpy.props.FloatProperty(default=0.0)
+    last_k2: bpy.props.FloatProperty(default=0.0)
     last_f_px: bpy.props.FloatProperty(default=0.0)
     crop_factor: bpy.props.FloatProperty(
         name="Crop factor",

@@ -516,35 +516,37 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
 
         print(f"[PBA solve] focal={lens:.2f}mm, sensor={sensor:.2f}mm, "
               f"точек={len(world_pts)}, "
-              f"дисторсия={'вкл' if pba.use_distortion else 'выкл'}, "
+              f"дисторсия={'K1+K2' if pba.use_distortion_k1 and pba.use_distortion_k2 else 'K1' if pba.use_distortion_k1 else 'K2' if pba.use_distortion_k2 else 'выкл'}, "
               f"crop={crop:.3f}")
         print(f"[PBA solve] base_f_px = {base_f_px:.1f}")
 
         best = None
         for name, f_px_try in candidates:
-            M_best, rmse, k1 = pose_refine_multistart(
+            M_best, rmse, k1, k2 = pose_refine_multistart(
                 world_pts, pixel_pts, W, H, f_px_try, M_init,
-                use_distortion=pba.use_distortion,
+                use_distortion_k1=pba.use_distortion_k1,
+                use_distortion_k2=pba.use_distortion_k2,
                 huber_delta=pba.huber_delta,
                 verbose=False)
             if M_best is None:
                 print(f"[PBA focal] {name}: LM не сошёлся")
                 continue
             print(f"[PBA focal] {name:16s} f_px={f_px_try:8.1f}  "
-                  f"rmse={rmse:7.3f} px  k1={k1:+.4f}")
+                  f"rmse={rmse:7.3f} px,  k1={k1:+.4f}, k2={k2:+.4f}")
             if best is None or rmse < best[1]:
-                best = (M_best, rmse, k1, f_px_try, name)
+                best = (M_best, rmse, k1, k2, f_px_try, name)
 
         if best is None:
             self.report({'ERROR'}, "LM не сошёлся ни для одного фокусного")
             return {'CANCELLED'}
 
-        M_best, rmse, k1, f_px_used, name_used = best
+        M_best, rmse, k1, k2, f_px_used, name_used = best
         print(f"[PBA focal] ВЫБРАНО: {name_used}, "
-              f"f_px={f_px_used:.1f}, rmse={rmse:.3f}, k1={k1:+.4f}")
+              f"f_px={f_px_used:.1f}, rmse={rmse:.3f}, k1={k1:+.4f}, k2={k2:+.4f}")
 
         cam.matrix_world = Matrix(M_best.tolist())
         pba.last_k1 = k1
+        pba.last_k2 = k2
         pba.last_f_px = f_px_used
 
         cx, cy = W / 2.0, H / 2.0
@@ -557,7 +559,7 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
             xn = (u_px - cx) / f_px_used
             yn = (v_px - cy) / f_px_used
             r2 = xn * xn + yn * yn
-            fac = 1.0 + k1 * r2
+            fac = 1.0 + k1 * r2 + k2 * r2 * r2
             u_d = f_px_used * xn * fac + cx
             v_d = f_px_used * yn * fac + cy
             err = ((u_d - c.x2d[0]) ** 2 + (v_d - c.x2d[1]) ** 2) ** 0.5
@@ -572,7 +574,7 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
             flag = "  <-- выброс" if err > 2.5 * mean_err else ""
             print(f"  pair {idx}: {err:7.2f} px{flag}")
 
-        dist_str = f" k1={k1:+.4f}" if pba.use_distortion else ""
+        dist_str = f" k1={k1:+.4f}, k2={k2:+.4f}" if pba.use_distortion_k1 or pba.use_distortion_k2 else ""
         _set_status(
             scene,
             f"Ошибка: средняя {mean_err:.2f}px, макс {max_err:.2f}px. "
@@ -621,6 +623,7 @@ class PBA_VM_OT_diagnose_pairs(bpy.types.Operator):
 
         f_px = pba.last_f_px if pba.last_f_px > 0 else 1.0
         k1 = pba.last_k1
+        k2 = pba.last_k2
         cx, cy = W / 2.0, H / 2.0
 
         errors = []
@@ -632,7 +635,7 @@ class PBA_VM_OT_diagnose_pairs(bpy.types.Operator):
             xn = (u_px - cx) / f_px
             yn = (v_px - cy) / f_px
             r2 = xn * xn + yn * yn
-            fac = 1.0 + k1 * r2
+            fac = 1.0 + k1 * r2 + k2 * r2 * r2
             u_d = f_px * xn * fac + cx
             v_d = f_px * yn * fac + cy
             err = ((u_d - c.x2d[0]) ** 2 + (v_d - c.x2d[1]) ** 2) ** 0.5

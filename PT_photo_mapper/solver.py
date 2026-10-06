@@ -34,11 +34,12 @@ def _residuals_fixed_f(params, world_pts, pixel_pts, W, H, f_px):
     return res
 
 
-def _residuals_with_distortion(params, world_pts, pixel_pts, W, H, f_px):
-    """params: [rx, ry, rz, tx, ty, tz, k1]. Только радиальная k1."""
+def _residuals_with_distortion(params, world_pts, pixel_pts, W, H, f_px, use_k1=True, use_k2=False):
+    """params: [rx, ry, rz, tx, ty, tz, k1, k2]. Только радиальная k1-k2."""
     R_wc = _rodrigues(params[0:3])
     t_wc = params[3:6]
     k1 = params[6]
+    k2 = params[7]
     cx, cy = W / 2.0, H / 2.0
     res = np.zeros(2 * len(world_pts))
     for i, (X, xp) in enumerate(zip(world_pts, pixel_pts)):
@@ -50,12 +51,15 @@ def _residuals_with_distortion(params, world_pts, pixel_pts, W, H, f_px):
         xn = Xc[0] / Xc[2]
         yn = Xc[1] / Xc[2]
         r2 = xn * xn + yn * yn
-        fac = 1.0 + k1 * r2
+        fac = 1.0 + k1 * r2 if use_k1 else 1.0
+        fac += k2 * r2 * r2 if use_k2 else 0.0
         u = f_px * xn * fac + cx
         v = f_px * yn * fac + cy
         res[2 * i] = u - xp[0]
         res[2 * i + 1] = v - xp[1]
         if abs(k1) > 0.15:
+            res = res + 1e4 * np.sign(res)
+        if abs(k2) > 0.05:
             res = res + 1e4 * np.sign(res)
     return res
 
@@ -183,9 +187,9 @@ def pose_refine(world_pts, pixel_pts, W, H, f_px, M_init, huber_delta=0.0, max_i
 
 
 def pose_refine_with_distortion(world_pts, pixel_pts, W, H, f_px,
-                                  M_init, huber_delta=0.0, max_iter=150):
-    """LM по 7 параметрам: 6 позы + k1. Фокусное фиксировано.
-    Возвращает (M, rmse, k1)."""
+                                  M_init, huber_delta=0.0, use_k1=True, use_k2=False, max_iter=150):
+    """LM по 7-8 параметрам: 6 позы + k1/k2. Фокусное фиксировано.
+    Возвращает (M, rmse, k1, k2)."""
     p0 = _params_from_matrix(M_init)
     t_scale = max(float(np.linalg.norm(p0[3:6])), 0.1)
 
@@ -194,23 +198,25 @@ def pose_refine_with_distortion(world_pts, pixel_pts, W, H, f_px,
             ps[0:3],
             ps[3:6] * t_scale,
             [ps[6]],  # k1 как есть (и так малый)
+            [ps[7]],  # k2 как есть (и так малый)
         ])
 
     def cost(ps):
         return _residuals_with_distortion(unscale(ps), world_pts,
-                                            pixel_pts, W, H, f_px)
+                                            pixel_pts, W, H, f_px, use_k1=use_k1, use_k2=use_k2)
 
     params0 = np.concatenate([
-        p0[0:3], p0[3:6] / t_scale, [0.0],
+        p0[0:3], p0[3:6] / t_scale, [0.0], [0.0],
     ])
-    final, _, err = _lm_solve(cost, params0, 7, max_iter,
+    final, _, err = _lm_solve(cost, params0, 8, max_iter,
                                huber_delta=huber_delta)
 
     unscaled = unscale(final)
     M = _matrix_from_pose(unscaled[0:6])
     k1 = float(unscaled[6])
+    k2 = float(unscaled[7])
     rmse = float(np.sqrt(err / len(world_pts)))
-    return M, rmse, k1
+    return M, rmse, k1, k2
 
 
 def _make_candidates(M_init):
@@ -234,30 +240,34 @@ def _make_candidates(M_init):
 
 
 def pose_refine_multistart(world_pts, pixel_pts, W, H, f_px, M_init,
-                            use_distortion=False, verbose=False, huber_delta=0.0):
+                            use_distortion_k1=False, use_distortion_k2=False,
+                            verbose=False, huber_delta=0.0):
     """Многозапусковый LM. Возвращает (M, rmse, k1, k2)."""
     candidates = _make_candidates(M_init)
     results = []
     best_M = None
     best_rmse = float('inf')
     best_k1 = 0.0
+    best_k2 = 0.0
 
     for M_c in candidates:
-        if use_distortion:
-            M_r, rmse, k1 = pose_refine_with_distortion(
-                world_pts, pixel_pts, W, H, f_px, M_c, huber_delta=huber_delta)
+        if use_distortion_k1 or use_distortion_k2:
+            M_r, rmse, k1, k2 = pose_refine_with_distortion(
+                world_pts, pixel_pts, W, H, f_px, M_c, huber_delta=huber_delta, use_k1=use_distortion_k1, use_k2=use_distortion_k2)
         else:
             M_r, rmse = pose_refine(
                 world_pts, pixel_pts, W, H, f_px, M_c, huber_delta=huber_delta)
             k1 = 0.0
+            k2 = 0.0
         results.append(rmse)
         if rmse < best_rmse:
             best_rmse = rmse
             best_M = M_r
             best_k1 = k1
+            best_k2 = k2
 
     if verbose:
         print(f"[PBA multistart] {len(candidates)} запусков, "
               f"rmse от {min(results):.3f} до {max(results):.3f}")
 
-    return best_M, best_rmse, best_k1
+    return best_M, best_rmse, best_k1, best_k2
