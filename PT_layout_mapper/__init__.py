@@ -60,6 +60,12 @@ class PBA_LM_Props(bpy.types.PropertyGroup):
         description="Насколько близко к #FF00FF должен быть пиксель "
                     "(0.05 — очень строго, 0.5 — лояльно)",
         default=0.30, min=0.05, max=1.0)
+    active_quad_index: bpy.props.IntProperty(default=-1)
+    highlight_size: bpy.props.FloatProperty(
+        name="Размер маркеров, м", default=0.10,
+        min=0.01, max=1.0)
+    highlight_layout_obj: bpy.props.StringProperty(default="")
+    highlight_model_obj: bpy.props.StringProperty(default="")
 
 
 classes = ((PBA_LM_Corner3D, PBA_LM_Quad, PBA_LM_Props)

@@ -22,6 +22,7 @@ class PBA_LM_PT_main(bpy.types.Panel):
         row.prop(pba, "plane_offset_m", text="Отступ, м")
         row = box.row(align=True)
         row.operator("pba_lm.load_layout", icon='FILE_NEW')
+        row.operator("pba_lm.import_json", icon='IMPORT')
         row.operator("pba_lm.frame_layout", icon='VIEW_CAMERA')
 
         # Current quad
@@ -61,13 +62,42 @@ class PBA_LM_PT_main(bpy.types.Panel):
         # Quads list
         box = layout.box()
         box.label(text=f"Quads ({len(pba.quads)})", icon='MESH_GRID')
+        box.prop(pba, "highlight_size", text="Размер маркера, м")
+
         if pba.quads:
             for i, q in enumerate(pba.quads):
                 row = box.row(align=True)
+                active = (i == pba.active_quad_index)
+                icon = 'RADIOBUT_ON' if active else 'RADIOBUT_OFF'
                 label = f"{q.id}: {q.part or '(no part)'}"
-                row.label(text=label)
+
+                op_act = row.operator("pba_lm.set_active_quad",
+                                       text=label, icon=icon,
+                                       emboss=active)
+                op_act.index = i
+
+                op = row.operator("pba_lm.rotate_quad", text="↺",
+                                  icon='LOOP_BACK')
+                op.index = i
+                op.direction = -1
+
+                op = row.operator("pba_lm.rotate_quad", text="↻",
+                                  icon='LOOP_FORWARDS')
+                op.index = i
+                op.direction = 1
+
+                op = row.operator("pba_lm.flip_quad", text="⇄",
+                                  icon='ARROW_LEFTRIGHT')
+                op.index = i
+
                 op = row.operator("pba_lm.remove_quad", text="", icon='X')
                 op.index = i
+
+        row = box.row(align=True)
+        row.operator("pba_lm.refresh_highlight", text="Refresh",
+                     icon='FILE_REFRESH')
+        row.operator("pba_lm.validate_quads", text="Validate",
+                     icon='CHECKMARK')
 
         row = box.row(align=True)
         row.operator("pba_lm.clear_quads", text="Clear All", icon='TRASH')

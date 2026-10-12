@@ -16,6 +16,83 @@ PENDING_OBJ_NAME = "PBA_LM_Pending"
 COMMITTED_OBJ_NAME = "PBA_LM_Committed"
 
 
+CORNER_COLORS = [
+    (1.0, 0.0, 0.0, 1.0),   # 0 — красный
+    (0.0, 1.0, 0.0, 1.0),   # 1 — зелёный
+    (0.0, 0.0, 1.0, 1.0),   # 2 — синий
+    (1.0, 1.0, 0.0, 1.0),   # 3 — жёлтый
+]
+
+
+HIGHLIGHT_LAYOUT_NAME = "PBA_LM_Highlight_Layout"
+HIGHLIGHT_MODEL_NAME = "PBA_LM_Highlight_Model"
+
+
+def _ensure_color_material(name):
+    mat = bpy.data.materials.get(name)
+    if mat is not None:
+        return mat
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    attr = nt.nodes.new("ShaderNodeAttribute")
+    attr.attribute_name = "pba_color"
+    emit = nt.nodes.new("ShaderNodeEmission")
+    emit.inputs["Strength"].default_value = 1.0
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    nt.links.new(attr.outputs["Color"], emit.inputs["Color"])
+    nt.links.new(emit.outputs["Emission"], out.inputs["Surface"])
+    return mat
+
+
+def _apply_colors(mesh, colors_per_vertex):
+    """Создаёт или обновляет цветовой атрибут на mesh."""
+    if "pba_color" in mesh.color_attributes:
+        attr = mesh.color_attributes["pba_color"]
+    else:
+        attr = mesh.color_attributes.new(
+            name="pba_color", type='FLOAT_COLOR', domain='POINT')
+    for i, col in enumerate(colors_per_vertex):
+        if i < len(attr.data):
+            attr.data[i].color = col
+
+
+def _make_cross_geometry(cx, cy, cz, length, thickness):
+    l, t = length, thickness
+    verts = [
+        (cx - l, cy, cz - t), (cx + l, cy, cz - t),
+        (cx + l, cy, cz + t), (cx - l, cy, cz + t),
+        (cx - t, cy, cz - l), (cx + t, cy, cz - l),
+        (cx + t, cy, cz + l), (cx - t, cy, cz + l),
+    ]
+    faces = [(0, 1, 2, 3), (4, 5, 6, 7)]
+    return verts, faces
+
+
+def _make_octahedron_geometry(cx, cy, cz, size):
+    s = size
+    verts = [
+        (cx + s, cy, cz), (cx - s, cy, cz),
+        (cx, cy + s, cz), (cx, cy - s, cz),
+        (cx, cy, cz + s), (cx, cy, cz - s),
+    ]
+    faces = [
+        (0, 2, 4), (2, 1, 4), (1, 3, 4), (3, 0, 4),
+        (2, 0, 5), (1, 2, 5), (3, 1, 5), (0, 3, 5),
+    ]
+    return verts, faces
+
+
+def _delete_highlight_obj(scene, name):
+    obj = scene.objects.get(name)
+    if obj is not None:
+        mesh = obj.data
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+
+
 def _set_status(scene, msg):
     scene.pba_lm.status_msg = msg
     print(f"[PBA LM] {msg}")
@@ -428,6 +505,8 @@ class PBA_LM_OT_load_layout(bpy.types.Operator):
             return {'CANCELLED'}
 
         _remove_plane(scene)
+        _delete_highlight_obj(scene, HIGHLIGHT_LAYOUT_NAME)
+        _delete_highlight_obj(scene, HIGHLIGHT_MODEL_NAME)
         _remove_visual_objs(scene)
         _IMAGE_CACHE.clear()
         try:
@@ -667,6 +746,9 @@ class PBA_LM_OT_remove_quad(bpy.types.Operator):
         pba = context.scene.pba_lm
         if 0 <= self.index < len(pba.quads):
             pba.quads.remove(self.index)
+        pba.active_quad_index = min(
+            pba.active_quad_index, len(pba.quads) - 1)
+        bpy.ops.pba_lm.refresh_highlight()
         _rebuild_committed_mesh(context.scene)
         return {'FINISHED'}
 
@@ -680,6 +762,9 @@ class PBA_LM_OT_clear_quads(bpy.types.Operator):
         pba = context.scene.pba_lm
         pba.quads.clear()
         pba.quad_counter = 0
+        pba.active_quad_index = min(
+            pba.active_quad_index, len(pba.quads) - 1)
+        bpy.ops.pba_lm.refresh_highlight()
         _rebuild_committed_mesh(context.scene)
         _set_status(context.scene, "Все квады удалены")
         return {'FINISHED'}
@@ -853,6 +938,316 @@ class PBA_LM_OT_commit_quad(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _is_convex_quad_order(pts):
+    """Проверяет, что 4 точки в порядке обхода без самопересечений."""
+    n = len(pts)
+    sign = None
+    for i in range(n):
+        p0 = pts[i]
+        p1 = pts[(i + 1) % n]
+        p2 = pts[(i + 2) % n]
+        cross = ((p1[0] - p0[0]) * (p2[1] - p1[1])
+                 - (p1[1] - p0[1]) * (p2[0] - p1[0]))
+        if abs(cross) < 1e-9:
+            continue
+        s = 1 if cross > 0 else -1
+        if sign is None:
+            sign = s
+        elif s != sign:
+            return False
+    return True
+
+
+class PBA_LM_OT_validate_quads(bpy.types.Operator):
+    bl_idname = "pba_lm.validate_quads"
+    bl_label = "Validate Quads"
+    bl_description = "Проверить порядок углов в размеченных квадах"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        bad = []
+        for i, q in enumerate(pba.quads):
+            px = list(q.corners_px)
+            pts = [(px[0], px[1]), (px[2], px[3]),
+                   (px[4], px[5]), (px[6], px[7])]
+            if not _is_convex_quad_order(pts):
+                bad.append((i, q.id))
+
+        if not bad:
+            _set_status(context.scene,
+                        f"Все {len(pba.quads)} квадов корректны")
+            self.report({'INFO'}, "Все квады корректны")
+            return {'FINISHED'}
+
+        print("[PBA LM] Подозрительные квады (порядок углов):")
+        for i, qid in bad:
+            print(f"  [{i}] {qid}")
+        _set_status(context.scene,
+                    f"Подозрительных: {len(bad)} из {len(pba.quads)} "
+                    f"(см. консоль)")
+        self.report({'WARNING'}, f"Подозрительных: {len(bad)}")
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_rotate_quad(bpy.types.Operator):
+    bl_idname = "pba_lm.rotate_quad"
+    bl_label = "Rotate Quad"
+    bl_description = "Сдвинуть порядок углов квада на одну позицию"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+    direction: bpy.props.IntProperty(default=1)
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        if not (0 <= self.index < len(pba.quads)):
+            return {'CANCELLED'}
+        q = pba.quads[self.index]
+
+        items = [(
+            q.corners_3d[i].obj_name,
+            q.corners_3d[i].vertex_index,
+            tuple(q.corners_3d[i].x_world),
+        ) for i in range(4)]
+        if self.direction > 0:
+            items = items[1:] + items[:1]
+        else:
+            items = items[-1:] + items[:-1]
+        for i, (obj, vi, xw) in enumerate(items):
+            q.corners_3d[i].obj_name = obj
+            q.corners_3d[i].vertex_index = vi
+            q.corners_3d[i].x_world = xw
+
+        px = list(q.corners_px)
+        pts = [[px[0], px[1]], [px[2], px[3]],
+               [px[4], px[5]], [px[6], px[7]]]
+        if self.direction > 0:
+            pts = pts[1:] + pts[:1]
+        else:
+            pts = pts[-1:] + pts[:-1]
+        flat = []
+        for x, y in pts:
+            flat.extend([x, y])
+        q.corners_px = tuple(flat)
+
+        _set_status(context.scene, f"Квад {q.id} повёрнут")
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_flip_quad(bpy.types.Operator):
+    bl_idname = "pba_lm.flip_quad"
+    bl_label = "Flip Quad"
+    bl_description = "Обратить порядок углов (исправить зеркало)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        if not (0 <= self.index < len(pba.quads)):
+            return {'CANCELLED'}
+        q = pba.quads[self.index]
+
+        items = [(
+            q.corners_3d[i].obj_name,
+            q.corners_3d[i].vertex_index,
+            tuple(q.corners_3d[i].x_world),
+        ) for i in range(4)]
+        items = [items[0], items[3], items[2], items[1]]
+        for i, (obj, vi, xw) in enumerate(items):
+            q.corners_3d[i].obj_name = obj
+            q.corners_3d[i].vertex_index = vi
+            q.corners_3d[i].x_world = xw
+
+        px = list(q.corners_px)
+        pts = [[px[0], px[1]], [px[2], px[3]],
+               [px[4], px[5]], [px[6], px[7]]]
+        pts = [pts[0], pts[3], pts[2], pts[1]]
+        flat = []
+        for x, y in pts:
+            flat.extend([x, y])
+        q.corners_px = tuple(flat)
+
+        _set_status(context.scene, f"Квад {q.id} отражён")
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_import_json(bpy.types.Operator):
+    bl_idname = "pba_lm.import_json"
+    bl_label = "Import JSON"
+    bl_description = "Загрузить квады из JSON"
+
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    filter_glob: bpy.props.StringProperty(
+        default="*.json", options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        scene = context.scene
+        pba = scene.pba_lm
+        path = bpy.path.abspath(self.filepath)
+        if not path or not os.path.exists(path):
+            self.report({'ERROR'}, "Файл не найден")
+            return {'CANCELLED'}
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            self.report({'ERROR'}, f"Ошибка чтения: {e}")
+            return {'CANCELLED'}
+
+        pba.quads.clear()
+        for qd in data.get("quads", []):
+            q = pba.quads.add()
+            q.id = qd.get("id", "")
+            q.part = qd.get("part", "")
+            for cd in qd.get("corners_3d", []):
+                c = q.corners_3d.add()
+                c.obj_name = cd.get("obj", "")
+                c.vertex_index = int(cd.get("vertex", -1))
+                xw = cd.get("x_world", [0.0, 0.0, 0.0])
+                c.x_world = (float(xw[0]), float(xw[1]), float(xw[2]))
+            px_list = qd.get("corners_layout_px", [])
+            flat = [0.0] * 8
+            for i, pt in enumerate(px_list[:4]):
+                flat[i * 2] = float(pt[0])
+                flat[i * 2 + 1] = float(pt[1])
+            q.corners_px = tuple(flat)
+
+        pba.quad_counter = len(pba.quads)
+        pba.active_quad_index = 0 if pba.quads else -1
+
+        _rebuild_committed_mesh(scene)
+        _set_status(scene, f"Загружено квадов: {len(pba.quads)}")
+        self.report({'INFO'}, f"Загружено: {len(pba.quads)}")
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_set_active_quad(bpy.types.Operator):
+    bl_idname = "pba_lm.set_active_quad"
+    bl_label = "Set Active Quad"
+    bl_options = {'INTERNAL'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        if 0 <= self.index < len(pba.quads):
+            pba.active_quad_index = self.index
+            return bpy.ops.pba_lm.refresh_highlight()
+        return {'CANCELLED'}
+
+
+class PBA_LM_OT_refresh_highlight(bpy.types.Operator):
+    bl_idname = "pba_lm.refresh_highlight"
+    bl_label = "Refresh Highlight"
+    bl_description = "Перестроить маркеры активного квада"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        scene = context.scene
+        pba = scene.pba_lm
+
+        # Удаляем старые маркеры
+        _delete_highlight_obj(scene, HIGHLIGHT_LAYOUT_NAME)
+        _delete_highlight_obj(scene, HIGHLIGHT_MODEL_NAME)
+        pba.highlight_layout_obj = ""
+        pba.highlight_model_obj = ""
+
+        idx = pba.active_quad_index
+        if not (0 <= idx < len(pba.quads)):
+            return {'FINISHED'}
+
+        q = pba.quads[idx]
+        size = pba.highlight_size
+
+        # --- Маркеры на выкройке (крестики) ---
+        plane = _get_plane(scene)
+        img = _get_layout_image(scene)
+        if plane is not None and img is not None:
+            W_px, H_px = img.size
+            px = list(q.corners_px)
+            plane_y = plane.matrix_world.translation.y
+            cross_y = plane_y - 0.01
+
+            all_verts = []
+            all_faces = []
+            colors = []
+            for corner_i in range(4):
+                cx_px = px[corner_i * 2]
+                cy_px = px[corner_i * 2 + 1]
+                w = _pixel_to_world(plane, cx_px, cy_px, W_px, H_px)
+                if w is None:
+                    continue
+                v, f = _make_cross_geometry(
+                    w.x, cross_y, w.z,
+                    size * 1.5, size * 0.25)
+                base = len(all_verts)
+                all_verts.extend(v)
+                for face in f:
+                    all_faces.append(tuple(base + i for i in face))
+                for _ in range(len(v)):
+                    colors.append(CORNER_COLORS[corner_i])
+
+            if all_verts:
+                mesh = bpy.data.meshes.new(HIGHLIGHT_LAYOUT_NAME + "_mesh")
+                mesh.from_pydata(all_verts, [], all_faces)
+                mesh.update()
+                _apply_colors(mesh, colors)
+                obj = bpy.data.objects.new(HIGHLIGHT_LAYOUT_NAME, mesh)
+                scene.collection.objects.link(obj)
+                obj.data.materials.append(
+                    _ensure_color_material("PBA_LM_HighlightMat"))
+                pba.highlight_layout_obj = obj.name
+
+        # --- Маркеры на 3D-модели (октаэдры) + рёбра ---
+        corners_world = []
+        for c in q.corners_3d:
+            corners_world.append((c.x_world[0], c.x_world[1], c.x_world[2]))
+
+        if len(corners_world) == 4:
+            all_verts = []
+            all_faces = []
+            colors = []
+            for corner_i, cw in enumerate(corners_world):
+                v, f = _make_octahedron_geometry(
+                    cw[0], cw[1], cw[2], size)
+                base = len(all_verts)
+                all_verts.extend(v)
+                for face in f:
+                    all_faces.append(tuple(base + i for i in face))
+                for _ in range(len(v)):
+                    colors.append(CORNER_COLORS[corner_i])
+
+            # Рёбра контура квада — тонкие линии
+            # Добавим их как маленькие "трубки" — упрощённо, как два
+            # тонких четырёхугольника вдоль каждого ребра.
+            # Для простоты — только контур, без толщины, как wireframe edges.
+            edges_for_wire = [(0, 1), (1, 2), (2, 3), (3, 0)]
+
+            if all_verts:
+                mesh = bpy.data.meshes.new(HIGHLIGHT_MODEL_NAME + "_mesh")
+                mesh.from_pydata(all_verts, [], all_faces)
+                mesh.update()
+                _apply_colors(mesh, colors)
+                obj = bpy.data.objects.new(HIGHLIGHT_MODEL_NAME, mesh)
+                scene.collection.objects.link(obj)
+                obj.data.materials.append(
+                    _ensure_color_material("PBA_LM_HighlightMat"))
+                pba.highlight_model_obj = obj.name
+
+        _set_status(
+            scene,
+            f"Активный квад {q.id}: показаны маркеры "
+            f"(R=0, G=1, B=2, Y=3)")
+        return {'FINISHED'}
+
+
 classes = (
     PBA_LM_OT_load_layout,
     PBA_LM_OT_capture_3d,
@@ -863,5 +1258,11 @@ classes = (
     PBA_LM_OT_export_json,
     PBA_LM_OT_frame_layout,
     PBA_LM_OT_undo_last_click,
-    PBA_LM_OT_commit_quad
+    PBA_LM_OT_commit_quad,
+    PBA_LM_OT_validate_quads,
+    PBA_LM_OT_rotate_quad,
+    PBA_LM_OT_flip_quad,
+    PBA_LM_OT_import_json,
+    PBA_LM_OT_set_active_quad,
+    PBA_LM_OT_refresh_highlight
 )
