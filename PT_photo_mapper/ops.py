@@ -11,8 +11,7 @@ import bpy as bpy
 from bpy_extras.object_utils import world_to_camera_view
 from bpy_extras.view3d_utils import region_2d_to_vector_3d
 
-from .exif import camera_params, read_exif, to_float
-
+from .exif import camera_params, read_exif, to_float, detect_native_resolution
 
 DEFAULT_LENS_MM = 50.0
 DEFAULT_SENSOR_MM = 36.0
@@ -104,10 +103,14 @@ def _build_json_data(scene, path, W, H, cam_obj):
             "filename": os.path.basename(path),
             "width_px": int(W),
             "height_px": int(H),
+            "native_width_px": int(pba.native_width_px or W),
+            "native_height_px": int(pba.native_height_px or H),
+            "native_source": pba.native_source or "same",
         },
         "camera": {
             "name": cam_obj.name,
-            "lens_mm": float(cam_obj.data.lens),
+            "lens_mm": float(pba.physical_lens_mm),
+            "render_lens_mm": float(cam_obj.data.lens),
             "sensor_width_mm": float(cam_obj.data.sensor_width),
             "crop_factor": float(pba.crop_factor),
             "exif_focal_length_mm":
@@ -148,10 +151,23 @@ def _apply_json_data(scene, data, path, W, H, cam_obj):
         return False
 
     cam_info = data.get("camera", {})
-    lens = float(cam_info.get("lens_mm", 0.0))
+    physical_lens = float(cam_info.get("lens_mm", 0.0))
+    render_lens = float(cam_info.get("render_lens_mm", 0.0))
     sensor = float(cam_info.get("sensor_width_mm", 0.0))
-    if lens > 0:
-        cam_obj.data.lens = lens
+
+    # Если render_lens сохранён — используем его, иначе пересчитываем
+    nw = int(photo_info.get("native_width_px", W))
+    nh = int(photo_info.get("native_height_px", H))
+    max_native = max(nw, nh)
+    max_loaded = max(W, H)
+
+    if render_lens > 0:
+        cam_obj.data.lens = render_lens
+    elif physical_lens > 0:
+        cam_obj.data.lens = physical_lens * max_native / max_loaded
+
+    if physical_lens > 0:
+        pba.physical_lens_mm = physical_lens
     if sensor > 0:
         cam_obj.data.sensor_width = sensor
 
@@ -283,10 +299,24 @@ class PBA_VM_OT_load_photo(bpy.types.Operator):
             self.report({'ERROR'}, "Изображение пустое")
             return {'CANCELLED'}
 
-        if img.size[0] == 0 or img.size[1] == 0:
-            _set_status(scene, "Изображение пустое")
-            self.report({'ERROR'}, "Изображение пустое")
-            return {'CANCELLED'}
+        W_actual, H_actual = img.size
+
+        # Определяем нативное разрешение
+        if scene.pba_vm.use_native_resolution:
+            nw, nh, src = detect_native_resolution(
+                path, W_actual, H_actual)
+        else:
+            nw, nh, src = W_actual, H_actual, "same"
+
+        scene.pba_vm.native_width_px = nw
+        scene.pba_vm.native_height_px = nh
+        scene.pba_vm.native_source = src
+
+        if src != "same":
+            print(f"[PBA VM] Кроп: реальное {W_actual}×{H_actual}, "
+                  f"нативное {nw}×{nh} (источник: {src})")
+        else:
+            print(f"[PBA VM] Размер {W_actual}×{H_actual} — нативный")
 
         # Синхронизируем рендер с фото — иначе world_to_camera_view
         # работает в другом аспекте, и координаты уезжают.
@@ -303,11 +333,24 @@ class PBA_VM_OT_load_photo(bpy.types.Operator):
         if pos_key not in _POSITIONS:
             pos_key = 'FRONT'
         location, rotation = _POSITIONS[pos_key]
+        
+        nw = scene.pba_vm.native_width_px or W_actual
+        nh = scene.pba_vm.native_height_px or H_actual
+        max_native = max(nw, nh)
+        max_loaded = max(W_actual, H_actual)
+
+        physical_lens = focal if focal else DEFAULT_LENS_MM
+        scene.pba_vm.physical_lens_mm = physical_lens
+
+        # Рендерное фокусное: такое, чтобы Blender с текущим
+        # разрешением (loaded) давал то же f_px, что и физическая
+        # камера на нативном сенсоре.
+        render_lens = physical_lens * max_native / max_loaded
 
         _delete_old_camera(scene)
 
         cam_data = bpy.data.cameras.new(name=CAMERA_NAME)
-        cam_data.lens = focal
+        cam_data.lens = render_lens
         cam_data.sensor_width = sensor
 
         cam_obj = bpy.data.objects.new(name=CAMERA_NAME, object_data=cam_data)
@@ -347,10 +390,18 @@ class PBA_VM_OT_load_photo(bpy.types.Operator):
                     self.report({'WARNING'}, f"Ошибка чтения JSON {json_path}: {e}")
                     _set_status(scene, f"Ошибка JSON: {e}")
 
+        crop_info = ""
+        if scene.pba_vm.native_source != "same":
+            crop_info = (f" [кроп из "
+                          f"{scene.pba_vm.native_width_px}×"
+                          f"{scene.pba_vm.native_height_px}]")
+
         _set_status(
             scene,
-            f"Фото: {img.size[0]}×{img.size[1]}, "
-            f"focal={focal:.1f}мм, sensor={sensor:.2f}мм, "
+            f"Фото: {W_actual}×{H_actual}{crop_info}, "
+            f"focal={physical_lens:.1f}мм "
+            f"(render={render_lens:.1f}мм), "
+            f"sensor={sensor:.2f}мм, "
             f"старт: {_POSITION_LABEL[pos_key]}. "
             f"Numpad 0 — вид из камеры.")
         self.report({'INFO'}, "Камера настроена")
@@ -707,12 +758,18 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
         pba = scene.pba_vm
         lens = cam.data.lens
         sensor = cam.data.sensor_width
+
         if cam.data.sensor_fit == 'VERTICAL':
             base_f_px = lens / sensor * H
         elif cam.data.sensor_fit == 'HORIZONTAL':
             base_f_px = lens / sensor * W
         else:
             base_f_px = lens / sensor * max(W, H)
+
+        print(f"[PBA solve] lens={lens:.2f}мм (render), "
+              f"sensor={sensor:.2f}мм, "
+              f"loaded {W}×{H}, f_px={base_f_px:.1f}")
+        print(f"[PBA solve] base_f_px = {base_f_px:.1f}")
 
         crop = float(pba.crop_factor)
 

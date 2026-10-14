@@ -65,7 +65,16 @@ class PBA_VM_Props(bpy.types.PropertyGroup):
     name="Шаг, м",
     description="На сколько метров двигать вершины по одной оси",
     default=0.01, min=0.001, max=1.0)
-
+    use_native_resolution: bpy.props.BoolProperty(
+        name="Кроп: использовать нативное разрешение",
+        description="Если фото обрезано равномерно, учитывать "
+                    "нативное разрешение камеры при решении",
+        default=True)
+    native_width_px: bpy.props.IntProperty(default=0)
+    native_height_px: bpy.props.IntProperty(default=0)
+    native_source: bpy.props.StringProperty(default="")
+    physical_lens_mm: bpy.props.FloatProperty(
+        name="Physical lens (mm)", default=50.0)    
 
 classes = (PBA_VM_Correspondence, PBA_VM_Props) + ops.classes + panel.classes
 

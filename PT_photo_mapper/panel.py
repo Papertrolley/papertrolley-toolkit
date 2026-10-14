@@ -70,9 +70,8 @@ class PBA_VM_PT_main(bpy.types.Panel):
                                    text="", icon='ZOOM_SELECTED')
                 op_sel.index = i
 
-                op_snap = row.operator("pba_vm.snap_to_click",
-                                    text="", icon='SNAP_VERTEX')
-                op_snap.index = i
+                #op_snap = row.operator("pba_vm.snap_to_click", text="", icon='SNAP_VERTEX')
+                #op_snap.index = i
 
                 label = f"{i+1}. {c.obj_name} v{c.vertex_index} → " \
                         f"({c.x2d[0]:.0f}, {c.x2d[1]:.0f})"

@@ -65,12 +65,17 @@ def make_camera_matrix(photo_meta):
 
     W = float(photo_meta["photo"]["width_px"])
     H = float(photo_meta["photo"]["height_px"])
+    nW = float(photo_meta["photo"].get("native_width_px", W))
+    nH = float(photo_meta["photo"].get("native_height_px", H))
+
     f_px = float(photo_meta["solve"]["f_px"])
     if f_px <= 0:
         lens = float(cam["lens_mm"])
         sensor = float(cam["sensor_width_mm"])
-        f_px = lens / sensor * max(W, H)
+        # Если solve не выполнен — считаем от нативных размеров
+        f_px = lens / sensor * max(nW, nH)
 
+    # cx, cy — центр кропнутого изображения
     K = np.array([
         [f_px, 0.0, W / 2.0],
         [0.0, f_px, H / 2.0],
