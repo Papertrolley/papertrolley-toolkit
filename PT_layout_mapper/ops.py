@@ -320,7 +320,7 @@ def _rebuild_pending_mesh(scene):
 
 
 def _rebuild_committed_mesh(scene):
-    """Перестраивает outline всех закоммиченных квадов."""
+    """Перестраивает outline всех закоммиченных квадов и островов."""
     plane = _get_plane(scene)
     img = _get_layout_image(scene)
     pba = scene.pba_lm
@@ -334,8 +334,26 @@ def _rebuild_committed_mesh(scene):
 
     all_verts = []
     all_edges = []
+
+    # Квады — сплошные рёбра
     for q in pba.quads:
         px = list(q.corners_px)
+        base = len(all_verts)
+        for i in range(4):
+            w = _pixel_to_world(plane, px[i * 2], px[i * 2 + 1], W, H)
+            if w is None:
+                all_verts.append((0.0, 0.0, 0.0))
+            else:
+                all_verts.append((w.x, w.y, w.z))
+        all_edges.append((base + 0, base + 1))
+        all_edges.append((base + 1, base + 2))
+        all_edges.append((base + 2, base + 3))
+        all_edges.append((base + 3, base + 0))
+
+    # Острова — тоже сплошные рёбра (для визуального отличия можно
+    # сделать их другого цвета, но на этапе MVP — те же)
+    for isl in pba.islands:
+        px = list(isl.corners_layout_px)
         base = len(all_verts)
         for i in range(4):
             w = _pixel_to_world(plane, px[i * 2], px[i * 2 + 1], W, H)
@@ -478,6 +496,247 @@ def _project_for_sorting(points_world, view_dir):
     return pts_2d
 
 
+def _get_selected_face_indices(obj):
+    if bpy.context.mode != 'EDIT_MESH':
+        return []
+    import bmesh
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    return [f.index for f in bm.faces if f.select]
+
+
+def _find_island_faces(obj, uv_name, seed_indices):
+    """BFS по UV-связности. Работает и в Edit Mode, и в Object Mode."""
+    import bmesh
+    from collections import defaultdict
+
+    if (bpy.context.mode == 'EDIT_MESH'
+            and bpy.context.active_object == obj):
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        uv_layer = bm.loops.layers.uv.get(uv_name)
+        if uv_layer is None:
+            return set()
+        loop_map = defaultdict(list)
+        for f in bm.faces:
+            for loop in f.loops:
+                uv = loop[uv_layer].uv
+                key = (loop.vert.index, round(uv.x, 6), round(uv.y, 6))
+                loop_map[key].append(f.index)
+    else:
+        me = obj.data
+        uv_layer = me.uv_layers.get(uv_name)
+        if uv_layer is None or len(uv_layer.data) == 0:
+            return set()
+        loop_map = defaultdict(list)
+        for poly in me.polygons:
+            for li in poly.loop_indices:
+                vi = me.loops[li].vertex_index
+                uv = uv_layer.data[li].uv
+                key = (vi, round(uv.x, 6), round(uv.y, 6))
+                loop_map[key].append(poly.index)
+
+    visited = set(seed_indices)
+    queue = list(seed_indices)
+    head = 0
+    while head < len(queue):
+        fi = queue[head]
+        head += 1
+        if fi < 0:
+            continue
+        # Собрать вершины грани fi
+        if (bpy.context.mode == 'EDIT_MESH'
+                and bpy.context.active_object == obj):
+            bm.faces.ensure_lookup_table()
+            if fi >= len(bm.faces):
+                continue
+            face = bm.faces[fi]
+            for loop in face.loops:
+                uv = loop[uv_layer].uv
+                key = (loop.vert.index, round(uv.x, 6), round(uv.y, 6))
+                for other in loop_map[key]:
+                    if other not in visited:
+                        visited.add(other)
+                        queue.append(other)
+        else:
+            poly = obj.data.polygons[fi]
+            for li in poly.loop_indices:
+                vi = obj.data.loops[li].vertex_index
+                uv = uv_layer.data[li].uv
+                key = (vi, round(uv.x, 6), round(uv.y, 6))
+                for other in loop_map[key]:
+                    if other not in visited:
+                        visited.add(other)
+                        queue.append(other)
+    return visited
+
+
+def _vertex_uv_candidates(obj, uv_name, vertex_index, island_faces):
+    """Все уникальные UV данной вершины в гранях острова."""
+    import bmesh
+    if (bpy.context.mode == 'EDIT_MESH'
+            and bpy.context.active_object == obj):
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        uv_layer = bm.loops.layers.uv.get(uv_name)
+        if uv_layer is None:
+            return []
+        uvs = []
+        seen = set()
+        for fi in island_faces:
+            if fi < 0 or fi >= len(bm.faces):
+                continue
+            for loop in bm.faces[fi].loops:
+                if loop.vert.index == vertex_index:
+                    uv = loop[uv_layer].uv
+                    key = (round(uv.x, 6), round(uv.y, 6))
+                    if key not in seen:
+                        seen.add(key)
+                        uvs.append((uv.x, uv.y))
+        return uvs
+    else:
+        me = obj.data
+        uv_layer = me.uv_layers.get(uv_name)
+        if uv_layer is None:
+            return []
+        uvs = []
+        seen = set()
+        for fi in island_faces:
+            if fi < 0 or fi >= len(me.polygons):
+                continue
+            poly = me.polygons[fi]
+            for li in poly.loop_indices:
+                if me.loops[li].vertex_index == vertex_index:
+                    uv = uv_layer.data[li].uv
+                    key = (round(uv.x, 6), round(uv.y, 6))
+                    if key not in seen:
+                        seen.add(key)
+                        uvs.append((uv.x, uv.y))
+        return uvs
+
+
+def _find_nearest_vertex(context, event, obj, allowed_indices,
+                          radius_px=20.0):
+    """Ближайшая к курсору вершина из allowed_indices."""
+    from bpy_extras.view3d_utils import location_3d_to_region_2d
+    region = context.region
+    rv3d = context.space_data.region_3d
+    if region is None or rv3d is None:
+        return None
+    mouse = Vector((event.mouse_region_x, event.mouse_region_y))
+    best_idx = None
+    best_dist = radius_px
+    M = obj.matrix_world
+    for vi in allowed_indices:
+        p_world = M @ obj.data.vertices[vi].co
+        p_2d = location_3d_to_region_2d(region, rv3d, p_world)
+        if p_2d is None:
+            continue
+        d = (p_2d - mouse).length
+        if d < best_dist:
+            best_dist = d
+            best_idx = vi
+    return best_idx
+
+
+def _similarity_fit(uv_pts, layout_pts, theta_deg):
+    """Оптимальное подобие layout ≈ a·R(θ)·uv + t.
+    Возвращает (a, tx, ty, rmse) или None."""
+    import math
+    th = math.radians(theta_deg)
+    c, s = math.cos(th), math.sin(th)
+    R = np.array([[c, -s], [s, c]])
+
+    uv = np.asarray(uv_pts, dtype=np.float64)
+    lp = np.asarray(layout_pts, dtype=np.float64)
+
+    rot_pts = uv @ R.T  # (4, 2)
+
+    A = np.zeros((8, 3))
+    b = lp.reshape(-1)
+    for i in range(4):
+        A[2 * i, 0] = rot_pts[i, 0]
+        A[2 * i, 1] = 1.0
+        A[2 * i + 1, 0] = rot_pts[i, 1]
+        A[2 * i + 1, 2] = 1.0
+
+    try:
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    a, tx, ty = sol
+    if abs(a) < 1e-9:
+        return None
+
+    pred = np.zeros((4, 2))
+    for i in range(4):
+        pred[i, 0] = a * rot_pts[i, 0] + tx
+        pred[i, 1] = a * rot_pts[i, 1] + ty
+    res = lp - pred
+    rmse = float(np.sqrt((res ** 2).sum() / 4))
+    return (a, tx, ty, rmse)
+
+def _fit_best_uv_combination(candidates_per_corner, layout_px, verbose=True):
+    """Полный перебор кандидатов и углов 0..360° шагом 2°."""
+    import itertools
+    import math
+
+    layout = np.asarray(layout_px, dtype=np.float64)
+    n_lists = [len(c) for c in candidates_per_corner]
+    if any(n == 0 for n in n_lists):
+        return None, None, None
+
+    if verbose:
+        print(f"[PBA LM] Layout points: {layout.tolist()}")
+        for i, c in enumerate(candidates_per_corner):
+            cands_str = ", ".join(f"({u:.4f},{v:.4f})" for (u, v) in c)
+            print(f"[PBA LM]   corner {i}: {len(c)} cand: {cands_str}")
+
+    best_rmse = float('inf')
+    best_combo = None
+    best_params = None
+    best_uv_pts = None
+
+    thetas = list(range(0, 360, 2))
+
+    for combo in itertools.product(*[range(n) for n in n_lists]):
+        uv_pts = []
+        for i, k in enumerate(combo):
+            u, v = candidates_per_corner[i][k]
+            uv_pts.append((u, v))
+        uv_pts = np.asarray(uv_pts, dtype=np.float64)
+
+        for theta in thetas:
+            res = _similarity_fit(uv_pts, layout, theta)
+            if res is None:
+                continue
+            a, tx, ty, rmse = res
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_combo = combo
+                best_params = (a, theta, tx, ty)
+                best_uv_pts = uv_pts
+
+    if best_combo is None:
+        return None, None, None
+
+    if verbose:
+        print(f"[PBA LM] Best: rmse={best_rmse:.4f}, "
+              f"scale={best_params[0]:.3f}, θ={best_params[1]}°, "
+              f"combo={best_combo}")
+        a, theta, tx, ty = best_params
+        th = math.radians(theta)
+        c, s = math.cos(th), math.sin(th)
+        R = np.array([[c, -s], [s, c]])
+        for i in range(4):
+            rp = R @ best_uv_pts[i]
+            px = a * rp[0] + tx
+            py = a * rp[1] + ty
+            print(f"[PBA LM]   corner {i}: pred=({px:.1f},{py:.1f}) "
+                  f"act=({layout[i,0]:.1f},{layout[i,1]:.1f})")
+
+    return best_combo, best_rmse, best_params
+
 # --- Операторы ---
 
 class PBA_LM_OT_load_layout(bpy.types.Operator):
@@ -584,9 +843,19 @@ class PBA_LM_OT_pick_image_points(bpy.types.Operator):
         if _get_plane(scene) is None:
             self.report({'ERROR'}, "Плоскость выкройки не создана")
             return {'CANCELLED'}
-        if len(pba.pending_corners_3d) != 4:
-            self.report({'ERROR'}, "Сначала захватите 4 3D-вершины")
-            return {'CANCELLED'}
+
+        # Проверка в зависимости от режима
+        if pba.mode == 'ISLAND':
+            if len(pba.pending_island_corners) != 4:
+                self.report({'ERROR'},
+                            "Сначала выделите 4 вершины острова")
+                return {'CANCELLED'}
+        else:
+            if len(pba.pending_corners_3d) != 4:
+                self.report({'ERROR'},
+                            "Сначала захватите 4 3D-вершины")
+                return {'CANCELLED'}
+
         if context.area is None or context.area.type != 'VIEW_3D':
             self.report({'ERROR'}, "Запустите из 3D Viewport")
             return {'CANCELLED'}
@@ -677,7 +946,7 @@ class PBA_LM_OT_pick_image_points(bpy.types.Operator):
             if self._clicks >= 4:
                 context.workspace.status_text_set(None)
                 _set_status(scene,
-                            "4 точки заданы. Commit Quad или Undo Last.")
+                            "4 точки заданы. Commit или Undo Last.")
                 return {'FINISHED'}
 
         return {'RUNNING_MODAL'}
@@ -779,8 +1048,9 @@ class PBA_LM_OT_export_json(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
         pba = scene.pba_lm
-        if not pba.quads:
-            self.report({'WARNING'}, "Нет размеченных квадов")
+        if not pba.quads and not pba.islands:
+            self.report({'WARNING'},
+                        "Нет размеченных квадов или островов")
             return {'CANCELLED'}
 
         layout_path = bpy.path.abspath(pba.layout_path)
@@ -816,12 +1086,41 @@ class PBA_LM_OT_export_json(bpy.types.Operator):
                 "corners_layout_px": corners_px,
             })
 
+        islands_data = []
+        for isl in pba.islands:
+            corners = []
+            for c in isl.corners:
+                corners.append({
+                    "obj": c.obj_name,
+                    "vertex": c.vertex_index,
+                    "uv": [float(c.uv[0]), float(c.uv[1])],
+                    "x_world": [float(c.x_world[0]),
+                                 float(c.x_world[1]),
+                                 float(c.x_world[2])],
+                })
+            px = list(isl.corners_layout_px)
+            corners_px = [[px[0], px[1]], [px[2], px[3]],
+                          [px[4], px[5]], [px[6], px[7]]]
+            item = {
+                "id": isl.id,
+                "part": isl.part,
+                "corners": corners,
+                "corners_layout_px": corners_px,
+            }
+            res = [c.fit_residual for c in isl.corners if c.fit_residual >= 0]
+            if res:
+                item["fit_residual"] = float(res[0])
+            if isl.duplicate_of:
+                item["duplicate_of"] = isl.duplicate_of
+            islands_data.append(item)
+
         data = {
             "sheet": os.path.basename(layout_path),
             "size": [W_px, H_px],
             "dpi": 600,
             "orientation": orientation,
             "quads": quads_data,
+            "islands": islands_data
         }
 
         out = os.path.splitext(layout_path)[0] + ".quads.json"
@@ -992,8 +1291,8 @@ class PBA_LM_OT_validate_quads(bpy.types.Operator):
 
 class PBA_LM_OT_rotate_quad(bpy.types.Operator):
     bl_idname = "pba_lm.rotate_quad"
-    bl_label = "Rotate Quad"
-    bl_description = "Сдвинуть порядок углов квада на одну позицию"
+    bl_label = "Rotate Quad Order"
+    bl_description = "Сдвинуть порядок 2D-кликов квада на одну позицию"
     bl_options = {'REGISTER', 'UNDO'}
 
     index: bpy.props.IntProperty()
@@ -1004,20 +1303,6 @@ class PBA_LM_OT_rotate_quad(bpy.types.Operator):
         if not (0 <= self.index < len(pba.quads)):
             return {'CANCELLED'}
         q = pba.quads[self.index]
-
-        items = [(
-            q.corners_3d[i].obj_name,
-            q.corners_3d[i].vertex_index,
-            tuple(q.corners_3d[i].x_world),
-        ) for i in range(4)]
-        if self.direction > 0:
-            items = items[1:] + items[:1]
-        else:
-            items = items[-1:] + items[:-1]
-        for i, (obj, vi, xw) in enumerate(items):
-            q.corners_3d[i].obj_name = obj
-            q.corners_3d[i].vertex_index = vi
-            q.corners_3d[i].x_world = xw
 
         px = list(q.corners_px)
         pts = [[px[0], px[1]], [px[2], px[3]],
@@ -1031,11 +1316,37 @@ class PBA_LM_OT_rotate_quad(bpy.types.Operator):
             flat.extend([x, y])
         q.corners_px = tuple(flat)
 
-        _set_status(context.scene, f"Квад {q.id} повёрнут")
+        _set_status(context.scene,
+                    f"Квад {q.id}: поворот 2D-кликов")
         return {'FINISHED'}
 
 
 class PBA_LM_OT_flip_quad(bpy.types.Operator):
+    bl_idname = "pba_lm.flip_quad"
+    bl_label = "Flip Quad Order"
+    bl_description = "Обратить порядок 2D-кликов"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        if not (0 <= self.index < len(pba.quads)):
+            return {'CANCELLED'}
+        q = pba.quads[self.index]
+
+        px = list(q.corners_px)
+        pts = [[px[0], px[1]], [px[2], px[3]],
+               [px[4], px[5]], [px[6], px[7]]]
+        pts = [pts[0], pts[3], pts[2], pts[1]]
+        flat = []
+        for x, y in pts:
+            flat.extend([x, y])
+        q.corners_px = tuple(flat)
+
+        _set_status(context.scene,
+                    f"Квад {q.id}: отражение 2D-кликов")
+        return {'FINISHED'}
     bl_idname = "pba_lm.flip_quad"
     bl_label = "Flip Quad"
     bl_description = "Обратить порядок углов (исправить зеркало)"
@@ -1207,8 +1518,21 @@ class PBA_LM_OT_refresh_highlight(bpy.types.Operator):
 
         # --- Маркеры на 3D-модели (октаэдры) + рёбра ---
         corners_world = []
+        missing = []
         for c in q.corners_3d:
-            corners_world.append((c.x_world[0], c.x_world[1], c.x_world[2]))
+            obj = scene.objects.get(c.obj_name)
+            if (obj is not None and obj.type == 'MESH'
+                    and 0 <= c.vertex_index < len(obj.data.vertices)):
+                v = obj.data.vertices[c.vertex_index]
+                p = obj.matrix_world @ v.co
+                corners_world.append((p.x, p.y, p.z))
+            else:
+                # Fallback: сохранённые координаты из JSON
+                corners_world.append((c.x_world[0],
+                                       c.x_world[1],
+                                       c.x_world[2]))
+                missing.append(c.obj_name)
+                missing.append(c.obj_name)
 
         if len(corners_world) == 4:
             all_verts = []
@@ -1241,10 +1565,446 @@ class PBA_LM_OT_refresh_highlight(bpy.types.Operator):
                     _ensure_color_material("PBA_LM_HighlightMat"))
                 pba.highlight_model_obj = obj.name
 
+        status_tail = ""
+        if missing:
+            status_tail = f" (не найдены: {', '.join(set(missing))})"
+
         _set_status(
             scene,
-            f"Активный квад {q.id}: показаны маркеры "
-            f"(R=0, G=1, B=2, Y=3)")
+            f"Активный квад {q.id}: маркеры по текущему положению "
+            f"вершин (R=0, G=1, B=2, Y=3){status_tail}")
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_start_island(bpy.types.Operator):
+    bl_idname = "pba_lm.start_island"
+    bl_label = "Start Island"
+    bl_description = ("Подготовить остров: выделите грани одной "
+                      "UV-развёртки в Edit Mode")
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        scene = context.scene
+        pba = scene.pba_lm
+
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, "Нужен активный mesh-объект")
+            return {'CANCELLED'}
+        if context.mode != 'EDIT_MESH':
+            self.report({'ERROR'}, "Нужен Edit Mode")
+            return {'CANCELLED'}
+
+        uv_name = None
+        if obj.data.uv_layers.active is not None:
+            uv_name = obj.data.uv_layers.active.name
+        elif obj.data.uv_layers:
+            uv_name = obj.data.uv_layers[0].name
+        if uv_name is None:
+            self.report({'ERROR'}, "У объекта нет UV-слоя")
+            return {'CANCELLED'}
+
+        seeds = _get_selected_face_indices(obj)
+        if not seeds:
+            self.report({'ERROR'}, "Выделите грани острова (L под курсором)")
+            return {'CANCELLED'}
+
+        island_faces = _find_island_faces(obj, uv_name, seeds)
+        if not island_faces:
+            self.report({'ERROR'}, "Остров не найден")
+            return {'CANCELLED'}
+
+        pba.pending_island_obj = obj.name
+        pba.pending_island_uv_name = uv_name
+        pba.pending_island_corners.clear()
+        pba.pending_corners_px = (0.0,) * 8
+        pba.pending_px_count = 0
+
+        _set_status(
+            scene,
+            f"Остров: {obj.name}, {len(island_faces)} граней. "
+            f"Кликните 4 вершины острова по порядку.")
+        self.report({'INFO'},
+                    f"Остров: {len(island_faces)} граней")
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_pick_island_vertices(bpy.types.Operator):
+    bl_idname = "pba_lm.pick_island_vertices"
+    bl_label = "Pick 4 Island Vertices"
+    bl_description = "Кликните 4 вершины острова по порядку"
+
+    _clicks = 0
+    _island_faces = None
+    _allowed = None
+
+    def invoke(self, context, event):
+        scene = context.scene
+        pba = scene.pba_lm
+        obj = context.active_object
+        if obj is None or obj.name != pba.pending_island_obj:
+            self.report({'ERROR'},
+                        "Активный объект не совпадает с pending островом")
+            return {'CANCELLED'}
+        if context.area is None or context.area.type != 'VIEW_3D':
+            self.report({'ERROR'}, "Запустите из 3D Viewport")
+            return {'CANCELLED'}
+
+        seeds = _get_selected_face_indices(obj)
+        if not seeds:
+            self.report({'ERROR'}, "Выделение острова потеряно, "
+                        "перезапустите Start Island")
+            return {'CANCELLED'}
+
+        self._island_faces = _find_island_faces(
+            obj, pba.pending_island_uv_name, seeds)
+        verts = set()
+        for fi in self._island_faces:
+            poly = obj.data.polygons[fi]
+            for li in poly.loop_indices:
+                verts.add(obj.data.loops[li].vertex_index)
+        self._allowed = verts
+        self._clicks = 0
+
+        context.window_manager.modal_handler_add(self)
+        context.workspace.status_text_set(
+            "Кликните вершину 1 из 4 (ESC — отмена)")
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type in {'ESC', 'RIGHTMOUSE'}:
+            context.workspace.status_text_set(None)
+            _set_status(context.scene, "Отменено")
+            return {'CANCELLED'}
+
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            scene = context.scene
+            pba = scene.pba_lm
+            obj = context.active_object
+
+            vi = _find_nearest_vertex(context, event, obj, self._allowed)
+            if vi is None:
+                return {'RUNNING_MODAL'}
+
+            uvs = _vertex_uv_candidates(
+                obj, pba.pending_island_uv_name, vi, self._island_faces)
+            if not uvs:
+                return {'RUNNING_MODAL'}
+
+            p_world = obj.matrix_world @ obj.data.vertices[vi].co
+            c = pba.pending_island_corners.add()
+            c.obj_name = obj.name
+            c.vertex_index = vi
+            n = min(len(uvs), 8)
+            c.n_uv_candidates = n
+            arr = [0.0] * 16
+            for k in range(n):
+                arr[k * 2] = uvs[k][0]
+                arr[k * 2 + 1] = uvs[k][1]
+            c.uv_candidates = tuple(arr)
+            c.uv = uvs[0]
+            c.x_world = (p_world.x, p_world.y, p_world.z)
+            self._clicks += 1
+
+            _set_status(
+                scene,
+                f"Вершина {self._clicks}: v{vi}, "
+                f"{n} UV-вариант(ов)")
+
+            # Обновить панель
+            if context.area is not None:
+                context.area.tag_redraw()
+
+            if self._clicks >= 4:
+                context.workspace.status_text_set(None)
+                _set_status(
+                    scene,
+                    "4 вершины заданы. Теперь Pick 4 Layout Points.")
+                return {'FINISHED'}
+
+            context.workspace.status_text_set(
+                f"Кликните вершину {self._clicks + 1} из 4")
+
+        return {'RUNNING_MODAL'}
+
+
+class PBA_LM_OT_cancel_island(bpy.types.Operator):
+    bl_idname = "pba_lm.cancel_island"
+    bl_label = "Cancel Island"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        pba.pending_island_obj = ""
+        pba.pending_island_uv_name = ""
+        pba.pending_island_corners.clear()
+        pba.pending_corners_px = (0.0,) * 8
+        pba.pending_px_count = 0
+        _set_status(context.scene, "Остров сброшен")
+        return {'FINISHED'}
+
+
+def _commit_island(scene):
+    pba = scene.pba_lm
+    if len(pba.pending_island_corners) != 4:
+        return
+    if pba.pending_px_count != 4:
+        return
+
+    # Собираем кандидатов
+    candidates_per_corner = []
+    for c in pba.pending_island_corners:
+        n = c.n_uv_candidates
+        if n == 0:
+            candidates_per_corner.append([(c.uv[0], c.uv[1])])
+        else:
+            lst = []
+            for k in range(n):
+                lst.append((c.uv_candidates[k * 2],
+                            c.uv_candidates[k * 2 + 1]))
+            candidates_per_corner.append(lst)
+
+    px = list(pba.pending_corners_px)
+    layout_px = [(px[i * 2], px[i * 2 + 1]) for i in range(4)]
+
+    combo, rmse, params = _fit_best_uv_combination(
+        candidates_per_corner, layout_px, verbose=True)
+
+    if combo is not None:
+        for i, c in enumerate(pba.pending_island_corners):
+            u, v = candidates_per_corner[i][combo[i]]
+            c.uv = (u, v)
+            c.fit_residual = rmse
+
+    # Создание записи
+    isl = pba.islands.add()
+    pba.island_counter += 1
+    isl.id = f"i_{pba.island_counter:03d}"
+    isl.part = pba.pending_part
+
+    for c in pba.pending_island_corners:
+        nc = isl.corners.add()
+        nc.obj_name = c.obj_name
+        nc.vertex_index = c.vertex_index
+        nc.uv = (c.uv[0], c.uv[1])
+        nc.x_world = (c.x_world[0], c.x_world[1], c.x_world[2])
+        nc.uv_candidates = tuple(c.uv_candidates)
+        nc.n_uv_candidates = c.n_uv_candidates
+        nc.fit_residual = c.fit_residual
+
+    isl.corners_layout_px = tuple(pba.pending_corners_px)
+
+    pba.pending_island_obj = ""
+    pba.pending_island_uv_name = ""
+    pba.pending_island_corners.clear()
+    pba.pending_corners_px = (0.0,) * 8
+    pba.pending_px_count = 0
+
+    if rmse is not None:
+        _set_status(scene,
+                    f"Остров {isl.id}: UV-fit rmse={rmse:.5f}")
+    else:
+        _set_status(scene,
+                    f"Остров {isl.id}: UV-fit не сошёлся")
+
+
+class PBA_LM_OT_commit_island(bpy.types.Operator):
+    bl_idname = "pba_lm.commit_island"
+    bl_label = "Commit Island"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        pba = scene.pba_lm
+        if len(pba.pending_island_corners) != 4:
+            self.report({'ERROR'},
+                        f"Вершин острова: {len(pba.pending_island_corners)}, "
+                        f"нужно 4")
+            return {'CANCELLED'}
+        if pba.pending_px_count != 4:
+            self.report({'ERROR'},
+                        f"Точек на выкройке: {pba.pending_px_count}, "
+                        f"нужно 4")
+            return {'CANCELLED'}
+
+        _commit_island(scene)
+        _rebuild_pending_mesh(scene)
+        _rebuild_committed_mesh(scene)
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_rotate_island(bpy.types.Operator):
+    bl_idname = "pba_lm.rotate_island"
+    bl_label = "Rotate Island Order"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+    direction: bpy.props.IntProperty(default=1)
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        if not (0 <= self.index < len(pba.islands)):
+            return {'CANCELLED'}
+        isl = pba.islands[self.index]
+
+        px = list(isl.corners_layout_px)
+        pts = [[px[0], px[1]], [px[2], px[3]],
+               [px[4], px[5]], [px[6], px[7]]]
+        if self.direction > 0:
+            pts = pts[1:] + pts[:1]
+        else:
+            pts = pts[-1:] + pts[:-1]
+        flat = []
+        for x, y in pts:
+            flat.extend([x, y])
+        isl.corners_layout_px = tuple(flat)
+
+        _set_status(context.scene,
+                    f"Остров {isl.id}: поворот {self.target}")
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_flip_island(bpy.types.Operator):
+    bl_idname = "pba_lm.flip_island"
+    bl_label = "Flip Island Order"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        if not (0 <= self.index < len(pba.islands)):
+            return {'CANCELLED'}
+        isl = pba.islands[self.index]
+
+        px = list(isl.corners_layout_px)
+        pts = [[px[0], px[1]], [px[2], px[3]],
+               [px[4], px[5]], [px[6], px[7]]]
+        pts = [pts[0], pts[3], pts[2], pts[1]]
+        flat = []
+        for x, y in pts:
+            flat.extend([x, y])
+        isl.corners_layout_px = tuple(flat)
+
+        _set_status(context.scene,
+                    f"Остров {isl.id}: отражение {self.target}")
+        return {'FINISHED'}
+
+class PBA_LM_OT_duplicate_quad(bpy.types.Operator):
+    bl_idname = "pba_lm.duplicate_quad"
+    bl_label = "Duplicate Quad"
+    bl_description = "Создать дубликат: те же 3D-вершины, новые точки"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        scene = context.scene
+        pba = scene.pba_lm
+        if not (0 <= self.index < len(pba.quads)):
+            return {'CANCELLED'}
+        src = pba.quads[self.index]
+
+        new_q = pba.quads.add()
+        pba.quad_counter += 1
+        new_q.id = f"q_{pba.quad_counter:03d}"
+        new_q.part = src.part
+        new_q.duplicate_of = src.id
+        for c in src.corners_3d:
+            nc = new_q.corners_3d.add()
+            nc.obj_name = c.obj_name
+            nc.vertex_index = c.vertex_index
+            nc.x_world = tuple(c.x_world)
+
+        # Восстанавливаем pending из нового квада (без точек выкройки)
+        pba.pending_corners_3d.clear()
+        for c in new_q.corners_3d:
+            pc = pba.pending_corners_3d.add()
+            pc.obj_name = c.obj_name
+            pc.vertex_index = c.vertex_index
+            pc.x_world = tuple(c.x_world)
+        pba.pending_corners_px = (0.0,) * 8
+        pba.pending_px_count = 0
+        pba.pending_part = src.part
+
+        _set_status(
+            scene,
+            f"Дубликат {new_q.id} (источник {src.id}). "
+            f"Кликните 4 новые точки на выкройке.")
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_duplicate_island(bpy.types.Operator):
+    bl_idname = "pba_lm.duplicate_island"
+    bl_label = "Duplicate Island"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        scene = context.scene
+        pba = scene.pba_lm
+        if not (0 <= self.index < len(pba.islands)):
+            return {'CANCELLED'}
+        src = pba.islands[self.index]
+
+        new_i = pba.islands.add()
+        pba.island_counter += 1
+        new_i.id = f"i_{pba.island_counter:03d}"
+        new_i.part = src.part
+        new_i.duplicate_of = src.id
+        for c in src.corners:
+            nc = new_i.corners.add()
+            nc.obj_name = c.obj_name
+            nc.vertex_index = c.vertex_index
+            nc.uv = tuple(c.uv)
+            nc.x_world = tuple(c.x_world)
+
+        pba.pending_island_corners.clear()
+        for c in new_i.corners:
+            pc = pba.pending_island_corners.add()
+            pc.obj_name = c.obj_name
+            pc.vertex_index = c.vertex_index
+            pc.uv = tuple(c.uv)
+            pc.x_world = tuple(c.x_world)
+        pba.pending_island_obj = src.corners[0].obj_name if src.corners else ""
+        pba.pending_island_uv_name = ""
+        pba.pending_corners_px = (0.0,) * 8
+        pba.pending_px_count = 0
+        pba.pending_part = src.part
+
+        _set_status(
+            scene,
+            f"Дубликат {new_i.id} (источник {src.id}). "
+            f"Кликните 4 новые точки на выкройке.")
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_remove_island(bpy.types.Operator):
+    bl_idname = "pba_lm.remove_island"
+    bl_label = "Remove Island"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        if 0 <= self.index < len(pba.islands):
+            pba.islands.remove(self.index)
+            _rebuild_committed_mesh(context.scene)
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_clear_islands(bpy.types.Operator):
+    bl_idname = "pba_lm.clear_islands"
+    bl_label = "Clear All Islands"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        pba.islands.clear()
+        pba.island_counter = 0
+        _rebuild_committed_mesh(context.scene)
         return {'FINISHED'}
 
 
@@ -1264,5 +2024,15 @@ classes = (
     PBA_LM_OT_flip_quad,
     PBA_LM_OT_import_json,
     PBA_LM_OT_set_active_quad,
-    PBA_LM_OT_refresh_highlight
+    PBA_LM_OT_refresh_highlight,
+    PBA_LM_OT_start_island,
+    PBA_LM_OT_pick_island_vertices,
+    PBA_LM_OT_cancel_island,
+    PBA_LM_OT_commit_island,
+    PBA_LM_OT_duplicate_quad,
+    PBA_LM_OT_duplicate_island,
+    PBA_LM_OT_remove_island,
+    PBA_LM_OT_clear_islands,
+    PBA_LM_OT_rotate_island,
+    PBA_LM_OT_flip_island,
 )

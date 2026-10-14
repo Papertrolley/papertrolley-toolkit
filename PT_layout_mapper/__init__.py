@@ -27,6 +27,35 @@ class PBA_LM_Quad(bpy.types.PropertyGroup):
     corners_px: bpy.props.FloatVectorProperty(size=8, default=(0.0,) * 8)
 
 
+class PBA_LM_IslandCorner(bpy.types.PropertyGroup):
+    obj_name: bpy.props.StringProperty(default="")
+    vertex_index: bpy.props.IntProperty(default=-1)
+    uv: bpy.props.FloatVectorProperty(size=2, default=(0.0, 0.0))
+    x_world: bpy.props.FloatVectorProperty(size=3, default=(0.0, 0.0, 0.0))
+    uv_candidates: bpy.props.FloatVectorProperty(
+        size=16, default=(0.0,) * 16)
+    n_uv_candidates: bpy.props.IntProperty(default=0)
+    fit_residual: bpy.props.FloatProperty(default=-1.0)
+
+
+class PBA_LM_Island(bpy.types.PropertyGroup):
+    id: bpy.props.StringProperty(default="")
+    part: bpy.props.StringProperty(default="")
+    corners: bpy.props.CollectionProperty(type=PBA_LM_IslandCorner)
+    corners_layout_px: bpy.props.FloatVectorProperty(
+        size=8, default=(0.0,) * 8)
+    duplicate_of: bpy.props.StringProperty(default="")
+
+
+class PBA_LM_Quad(bpy.types.PropertyGroup):
+    id: bpy.props.StringProperty(default="")
+    part: bpy.props.StringProperty(default="")
+    corners_3d: bpy.props.CollectionProperty(type=PBA_LM_Corner3D)
+    corners_px: bpy.props.FloatVectorProperty(
+        size=8, default=(0.0,) * 8)
+    duplicate_of: bpy.props.StringProperty(default="")
+
+
 class PBA_LM_Props(bpy.types.PropertyGroup):
     layout_path: bpy.props.StringProperty(subtype='FILE_PATH')
     layout_image_name: bpy.props.StringProperty(default="")
@@ -66,10 +95,27 @@ class PBA_LM_Props(bpy.types.PropertyGroup):
         min=0.01, max=1.0)
     highlight_layout_obj: bpy.props.StringProperty(default="")
     highlight_model_obj: bpy.props.StringProperty(default="")
+    mode: bpy.props.EnumProperty(
+        name="Mode",
+        items=[('QUAD', "Quad", "4 пары точек модель↔выкройка"),
+               ('ISLAND', "Island", "UV-остров целиком")],
+        default='QUAD')
+
+    islands: bpy.props.CollectionProperty(type=PBA_LM_Island)
+    island_counter: bpy.props.IntProperty(default=0)
+
+    # Pending для острова
+    pending_island_obj: bpy.props.StringProperty(default="")
+    pending_island_uv_name: bpy.props.StringProperty(default="")
+    pending_island_corners: bpy.props.CollectionProperty(
+        type=PBA_LM_IslandCorner)
 
 
-classes = ((PBA_LM_Corner3D, PBA_LM_Quad, PBA_LM_Props)
-           + ops.classes + panel.classes)
+classes = (
+    PBA_LM_Corner3D, PBA_LM_Quad,
+    PBA_LM_IslandCorner, PBA_LM_Island,
+    PBA_LM_Props,
+) + ops.classes + panel.classes
 
 
 def register():
