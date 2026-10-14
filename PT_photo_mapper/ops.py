@@ -1581,7 +1581,54 @@ class PBA_VM_OT_nudge_vertex(bpy.types.Operator):
             f"{len(selected)} вершин, синхронизировано {n}")
         return {'FINISHED'}
         
+
+class PBA_VM_OT_sort_pairs(bpy.types.Operator):
+    bl_idname = "pba_vm.sort_pairs"
+    bl_label = "Sort Pairs"
+    bl_description = ("Сортировка: сначала по объекту, затем по "
+                      "позиции клика сверху вниз, слева направо")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        pba = scene.pba_vm
+        n = len(pba.correspondences)
+        if n < 2:
+            _set_status(scene, f"Пар {n}, сортировка не нужна")
+            return {'FINISHED'}
+
+        data = []
+        for c in pba.correspondences:
+            data.append({
+                "obj_name": c.obj_name,
+                "vertex_index": c.vertex_index,
+                "vertex_uuid": c.vertex_uuid,
+                "x3d": (c.x3d[0], c.x3d[1], c.x3d[2]),
+                "x2d": (c.x2d[0], c.x2d[1]),
+                "enabled": c.enabled,
+                "last_error": c.last_error,
+                "sort_key": (c.obj_name, c.x2d[1], c.x2d[0]),
+            })
+
+        data.sort(key=lambda d: d["sort_key"])
+
+        pba.correspondences.clear()
+        for d in data:
+            c = pba.correspondences.add()
+            c.obj_name = d["obj_name"]
+            c.vertex_index = d["vertex_index"]
+            c.vertex_uuid = d["vertex_uuid"]
+            c.x3d = d["x3d"]
+            c.x2d = d["x2d"]
+            c.enabled = d["enabled"]
+            c.last_error = d["last_error"]
+
+        _set_status(scene, f"Пары отсортированы: {n}")
+        return {'FINISHED'}
+        
 classes += (
     PBA_VM_OT_snap_to_click,
     PBA_VM_OT_nudge_vertex,
+    PBA_VM_OT_sort_pairs,
 )
+        

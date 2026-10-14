@@ -101,6 +101,8 @@ class PBA_LM_PT_main(bpy.types.Panel):
                 op.index = i
 
             row = box.row(align=True)
+            row.operator("pba_lm.sort_islands", text="Sort Islands",
+                     icon='SORTALPHA')
             row.operator("pba_lm.clear_islands", text="Clear",
                          icon='TRASH')
             row.operator("pba_lm.export_json", text="Export",
@@ -181,6 +183,8 @@ class PBA_LM_PT_main(bpy.types.Panel):
                          icon='CHECKMARK')
 
             row = box.row(align=True)
+            row.operator("pba_lm.sort_quads", text="Sort Quads",
+                     icon='SORTALPHA')
             row.operator("pba_lm.clear_quads", text="Clear All", icon='TRASH')
             row.operator("pba_lm.export_json", text="Export", icon='EXPORT')
 

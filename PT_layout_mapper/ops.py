@@ -2242,6 +2242,138 @@ class PBA_LM_OT_set_active_island(bpy.types.Operator):
         return {'CANCELLED'}
 
 
+
+def _sort_key_from_px(corners_px):
+    """Ключ (min_y, min_x) — верхняя-левая точка по правилу C."""
+    px = list(corners_px)
+    pts = [(px[0], px[1]), (px[2], px[3]),
+           (px[4], px[5]), (px[6], px[7])]
+    min_pt = min(pts, key=lambda p: (p[1], p[0]))
+    return min_pt[1], min_pt[0]
+
+
+class PBA_LM_OT_sort_quads(bpy.types.Operator):
+    bl_idname = "pba_lm.sort_quads"
+    bl_label = "Sort Quads"
+    bl_description = ("Сортировка: сначала по объекту первого угла, "
+                      "затем сверху вниз, слева направо")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        pba = scene.pba_lm
+        n = len(pba.quads)
+        if n < 2:
+            _set_status(scene, f"Квадов {n}, сортировка не нужна")
+            return {'FINISHED'}
+
+        data = []
+        for q in pba.quads:
+            corners_3d = []
+            for c in q.corners_3d:
+                corners_3d.append({
+                    "obj_name": c.obj_name,
+                    "vertex_index": c.vertex_index,
+                    "vertex_uuid": c.vertex_uuid,
+                    "x_world": (c.x_world[0], c.x_world[1], c.x_world[2]),
+                })
+            obj_name = corners_3d[0]["obj_name"] if corners_3d else ""
+            py, px_ = _sort_key_from_px(q.corners_px)
+            data.append({
+                "id": q.id,
+                "part": q.part,
+                "duplicate_of": q.duplicate_of,
+                "corners_3d": corners_3d,
+                "corners_px": tuple(q.corners_px),
+                "sort_key": (obj_name, py, px_),
+            })
+
+        data.sort(key=lambda d: d["sort_key"])
+
+        pba.quads.clear()
+        for d in data:
+            q = pba.quads.add()
+            q.id = d["id"]
+            q.part = d["part"]
+            q.duplicate_of = d["duplicate_of"]
+            for c3d in d["corners_3d"]:
+                c = q.corners_3d.add()
+                c.obj_name = c3d["obj_name"]
+                c.vertex_index = c3d["vertex_index"]
+                c.vertex_uuid = c3d["vertex_uuid"]
+                c.x_world = c3d["x_world"]
+            q.corners_px = d["corners_px"]
+
+        pba.active_quad_index = -1
+        _set_status(scene, f"Квады отсортированы: {n}")
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_sort_islands(bpy.types.Operator):
+    bl_idname = "pba_lm.sort_islands"
+    bl_label = "Sort Islands"
+    bl_description = ("Сортировка: сначала по объекту первого угла, "
+                      "затем сверху вниз, слева направо")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        pba = scene.pba_lm
+        n = len(pba.islands)
+        if n < 2:
+            _set_status(scene, f"Островов {n}, сортировка не нужна")
+            return {'FINISHED'}
+
+        data = []
+        for isl in pba.islands:
+            corners = []
+            for c in isl.corners:
+                corners.append({
+                    "obj_name": c.obj_name,
+                    "vertex_index": c.vertex_index,
+                    "vertex_uuid": c.vertex_uuid,
+                    "uv": (c.uv[0], c.uv[1]),
+                    "x_world": (c.x_world[0], c.x_world[1], c.x_world[2]),
+                    "uv_candidates": tuple(c.uv_candidates),
+                    "n_uv_candidates": c.n_uv_candidates,
+                    "fit_residual": c.fit_residual,
+                })
+            obj_name = corners[0]["obj_name"] if corners else ""
+            py, px_ = _sort_key_from_px(isl.corners_layout_px)
+            data.append({
+                "id": isl.id,
+                "part": isl.part,
+                "duplicate_of": isl.duplicate_of,
+                "corners": corners,
+                "corners_layout_px": tuple(isl.corners_layout_px),
+                "sort_key": (obj_name, py, px_),
+            })
+
+        data.sort(key=lambda d: d["sort_key"])
+
+        pba.islands.clear()
+        for d in data:
+            isl = pba.islands.add()
+            isl.id = d["id"]
+            isl.part = d["part"]
+            isl.duplicate_of = d["duplicate_of"]
+            for cdata in d["corners"]:
+                c = isl.corners.add()
+                c.obj_name = cdata["obj_name"]
+                c.vertex_index = cdata["vertex_index"]
+                c.vertex_uuid = cdata["vertex_uuid"]
+                c.uv = cdata["uv"]
+                c.x_world = cdata["x_world"]
+                c.uv_candidates = cdata["uv_candidates"]
+                c.n_uv_candidates = cdata["n_uv_candidates"]
+                c.fit_residual = cdata["fit_residual"]
+            isl.corners_layout_px = d["corners_layout_px"]
+
+        pba.active_island_index = -1
+        _set_status(scene, f"Острова отсортированы: {n}")
+        return {'FINISHED'}
+
+
 classes = (
     PBA_LM_OT_load_layout,
     PBA_LM_OT_capture_3d,
@@ -2269,5 +2401,7 @@ classes = (
     PBA_LM_OT_clear_islands,
     PBA_LM_OT_rotate_island,
     PBA_LM_OT_flip_island,
-    PBA_LM_OT_set_active_island
+    PBA_LM_OT_set_active_island,
+    PBA_LM_OT_sort_quads,
+    PBA_LM_OT_sort_islands
 )

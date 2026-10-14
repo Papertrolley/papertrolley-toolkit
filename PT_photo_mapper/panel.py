@@ -99,6 +99,8 @@ class PBA_VM_PT_main(bpy.types.Panel):
                      icon='HIDE_ON')
         row.operator("pba_vm.enable_selected", text="Enable Sel.",
                      icon='HIDE_OFF')
+        row.operator("pba_vm.sort_pairs", text="Sort Pairs",
+                 icon='SORTALPHA')
 
         box.operator("pba_vm.clear_pairs", text="Clear All", icon='TRASH')
         box.operator("pba_vm.enable_all", text="Enable All", icon='RESTRICT_VIEW_OFF')
