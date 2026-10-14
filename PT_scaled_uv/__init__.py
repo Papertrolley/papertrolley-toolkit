@@ -1,7 +1,7 @@
 bl_info = {
     "name": "PT scaled UV",
     "author": "PaperTrolley",
-    "version": (0, 1, 0),
+    "version": (0, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > PT scaled UV",
     "description": "Калиброванный экспорт UV-развёртки для 1:87",
@@ -26,7 +26,7 @@ class PBA_UVE_Props(bpy.types.PropertyGroup):
     per_object_pngs: bpy.props.BoolProperty(
         name="Per-object PNGs", default=False)
 
-    line_width_px: bpy.props.IntProperty(name="Line width", default=2)
+    line_width_px: bpy.props.IntProperty(name="Line width", default=1)
     draw_line_color: bpy.props.FloatVectorProperty(
         name="Line color", size=3, default=(0.0, 0.0, 0.0),
         subtype='COLOR')
@@ -35,12 +35,13 @@ class PBA_UVE_Props(bpy.types.PropertyGroup):
         name="Marker color", size=3, default=(1.0, 0.0, 1.0),
         subtype='COLOR')
     marker_size_px: bpy.props.IntProperty(
-        name="Marker size, px", default=2, min=1, max=15,
+        name="Marker size, px", default=1, min=1, max=15,
         description="Радиус маркера в пикселях")
 
     output_path: bpy.props.StringProperty(subtype='FILE_PATH')
     status_msg: bpy.props.StringProperty(default="")
-
+    uuid_status_msg: bpy.props.StringProperty(default="")
+    
 
 classes = (PBA_UVE_Props,) + ops.classes + panel.classes
 

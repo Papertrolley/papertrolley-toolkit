@@ -40,6 +40,17 @@ class PBA_UVE_PT_main(bpy.types.Panel):
         box.prop(pba, "marker_size_px")
 
         box = layout.box()
+        box.label(text="Vertex UUIDs", icon='KEYFRAME_HLT')
+        col = box.column(align=True)
+        col.operator("pba_uv_export.assign_uuids",
+                     icon='PRESET_NEW')
+        col.operator("pba_uv_export.check_uuids",
+                     icon='CHECKMARK')
+        if pba.uuid_status_msg:
+            sub = box.row()
+            sub.label(text=pba.uuid_status_msg)
+
+        box = layout.box()
         box.label(text="Save", icon='FILE')
         box.prop(pba, "output_path", text="")
         box.operator("pba_uv_export.export", icon='EXPORT')

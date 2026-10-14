@@ -9,6 +9,71 @@ from PIL import Image, ImageDraw
 
 MM_PER_INCH = 25.4
 
+PBA_VERTEX_ID_ATTR = "pba_vertex_id"
+
+
+def get_uuid_attribute(mesh, create=False):
+    attr = mesh.attributes.get(PBA_VERTEX_ID_ATTR)
+    if attr is None and create:
+        attr = mesh.attributes.new(
+            name=PBA_VERTEX_ID_ATTR, type='INT', domain='POINT')
+    return attr
+
+
+def get_vertex_uuid(obj, vertex_index):
+    attr = get_uuid_attribute(obj.data, create=False)
+    if attr is None:
+        return 0
+    if len(attr.data) == 0:
+        return 0
+    n = len(obj.data.vertices)
+    if vertex_index < 0 or vertex_index >= n:
+        return 0
+    try:
+        return int(attr.data[vertex_index].value)
+    except Exception:
+        return 0
+
+
+def find_vertex_by_uuid(obj, uuid_val, hint_world=None):
+    if uuid_val <= 0:
+        return -1, 0
+    attr = get_uuid_attribute(obj.data, create=False)
+    if attr is None:
+        return -1, 0
+    if len(attr.data) == 0:
+        return -1, 0
+
+    n = min(len(obj.data.vertices), len(attr.data))
+    candidates = []
+    for i in range(n):
+        try:
+            if int(attr.data[i].value) == uuid_val:
+                candidates.append(i)
+        except Exception:
+            continue
+
+    if not candidates:
+        return -1, 0
+    if len(candidates) == 1:
+        return candidates[0], 1
+
+    if hint_world is not None:
+        from mathutils import Vector
+        M = obj.matrix_world
+        hint = Vector(hint_world)
+        best_i = candidates[0]
+        best_d = float('inf')
+        for i in candidates:
+            p = M @ obj.data.vertices[i].co
+            d = (p - hint).length
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return best_i, len(candidates)
+
+    return candidates[0], len(candidates)
+
 
 def _set_status(scene, msg):
     scene.pba_uv_exporter.status_msg = msg
@@ -394,6 +459,160 @@ class PBA_UVE_OT_export(bpy.types.Operator):
                     f"{len(obj_meta)} объектов, {canvas_w}×{canvas_h}")
         return {'FINISHED'}
 
-        
 
-classes = (PBA_UVE_OT_export,)
+class PBA_UVE_OT_assign_uuids(bpy.types.Operator):
+    bl_idname = "pba_uv_export.assign_uuids"
+    bl_label = "Assign Vertex UUIDs"
+    bl_description = ("Назначить уникальные ID всем вершинам "
+                      "выделенных mesh-объектов. Существующие ID "
+                      "сохраняются, нули и дубликаты получают "
+                      "свежие.")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        objs = [o for o in context.selected_objects if o.type == 'MESH']
+        if not objs:
+            act = context.active_object
+            if act is not None and act.type == 'MESH':
+                objs = [act]
+        if not objs:
+            self.report({'ERROR'}, "Выделите mesh-объекты")
+            return {'CANCELLED'}
+
+        # Глобальный максимум по всем объектам — избегаем коллизий
+        global_max = 0
+        for obj in objs:
+            attr = get_uuid_attribute(obj.data, create=False)
+            if attr is None:
+                continue
+            for i in range(len(attr.data)):
+                v = int(attr.data[i].value)
+                if v > global_max:
+                    global_max = v
+
+        total_new = 0
+        total_dupes = 0
+        total_kept = 0
+        seen = set()
+
+        for obj in objs:
+            me = obj.data
+            attr = get_uuid_attribute(me, create=False)
+
+            # Если атрибут есть, но пустой — пересоздать
+            if attr is not None and len(attr.data) == 0:
+                me.attributes.remove(attr)
+                attr = None
+
+            if attr is None:
+                attr = get_uuid_attribute(me, create=True)
+
+            n = len(me.vertices)
+            for i in range(n):
+                v = int(attr.data[i].value)
+                if v == 0:
+                    global_max += 1
+                    attr.data[i].value = global_max
+                    seen.add(global_max)
+                    total_new += 1
+                elif v in seen:
+                    global_max += 1
+                    attr.data[i].value = global_max
+                    seen.add(global_max)
+                    total_dupes += 1
+                else:
+                    seen.add(v)
+                    total_kept += 1
+            me.update()
+
+        parts = []
+        if total_new:
+            parts.append(f"{total_new} новых")
+        if total_dupes:
+            parts.append(f"{total_dupes} дубликатов")
+        if total_kept:
+            parts.append(f"{total_kept} без изменений")
+        msg = f"UUID: {', '.join(parts)}. Объектов: {len(objs)}"
+        scene.pba_uv_exporter.uuid_status_msg = msg
+        print(f"[PBA UVE] {msg}")
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+class PBA_UVE_OT_check_uuids(bpy.types.Operator):
+    bl_idname = "pba_uv_export.check_uuids"
+    bl_label = "Check UUIDs"
+    bl_description = ("Проверить состояние UUID у выделенных "
+                      "или всех mesh-объектов")
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        scene = context.scene
+        objs = [o for o in context.selected_objects if o.type == 'MESH']
+        if not objs:
+            objs = [o for o in scene.objects if o.type == 'MESH']
+        if not objs:
+            self.report({'WARNING'}, "Нет mesh-объектов")
+            return {'CANCELLED'}
+
+        total_verts = 0
+        total_with_uuid = 0
+        total_zero = 0
+        all_ids = {}
+
+        print(f"[PBA UVE] Проверка UUID для {len(objs)} объектов:")
+        for obj in objs:
+            me = obj.data
+            attr = get_uuid_attribute(me, create=False)
+            n_verts = len(me.vertices)
+            n_zero = 0
+            n_dupes = 0
+            local_seen = {}
+            if attr is not None:
+                for i in range(len(attr.data)):
+                    v = int(attr.data[i].value)
+                    if v == 0:
+                        n_zero += 1
+                        continue
+                    if v in all_ids and all_ids[v] != obj.name:
+                        n_dupes += 1
+                    all_ids[v] = obj.name
+                    local_seen[v] = local_seen.get(v, 0) + 1
+
+            total_verts += n_verts
+            total_with_uuid += n_verts - n_zero
+            total_zero += n_zero
+
+            status = "OK"
+            if attr is None:
+                status = "нет атрибута"
+            elif n_zero > 0:
+                status = f"{n_zero} нулей"
+            elif n_dupes > 0:
+                status = f"{n_dupes} дубликатов"
+
+            print(f"  {obj.name}: {n_verts} вершин, "
+                  f"UUID {n_verts - n_zero}, "
+                  f"нулей {n_zero} → {status}")
+
+        print(f"[PBA UVE] Итого: {total_verts} вершин, "
+              f"с UUID {total_with_uuid}, "
+              f"без UUID {total_zero}")
+
+        if total_zero > 0:
+            msg = (f"Есть {total_zero} вершин без UUID. "
+                   f"Выделите объекты и Assign Vertex UUIDs.")
+        else:
+            msg = f"Все {total_verts} вершин имеют UUID."
+
+        scene.pba_uv_exporter.uuid_status_msg = msg
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+classes = (
+    PBA_UVE_OT_export,
+    PBA_UVE_OT_assign_uuids,
+    PBA_UVE_OT_check_uuids,
+)

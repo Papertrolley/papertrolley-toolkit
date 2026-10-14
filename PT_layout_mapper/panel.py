@@ -67,10 +67,16 @@ class PBA_LM_PT_main(bpy.types.Panel):
                       icon='MESH_GRID')
             for i, isl in enumerate(pba.islands):
                 row = box.row(align=True)
+                active = (i == pba.active_island_index)
+                icon = 'RADIOBUT_ON' if active else 'RADIOBUT_OFF'
                 label = f"{isl.id}: {isl.part or '(no part)'}"
                 if isl.duplicate_of:
                     label += f" ← {isl.duplicate_of}"
-                row.label(text=label)
+
+                op_act = row.operator("pba_lm.set_active_island",
+                                       text=label, icon=icon,
+                                       emboss=active)
+                op_act.index = i
 
                 op = row.operator("pba_lm.rotate_island", text="↺",
                                   icon='LOOP_BACK')

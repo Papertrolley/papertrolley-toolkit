@@ -8,6 +8,91 @@ import numpy as np
 from mathutils import Vector
 from bpy_extras.view3d_utils import (region_2d_to_origin_3d,
                                       region_2d_to_vector_3d)
+PBA_VERTEX_ID_ATTR = "pba_vertex_id"
+
+
+def _get_uuid_attr(mesh, create=False):
+    attr = mesh.attributes.get(PBA_VERTEX_ID_ATTR)
+    if attr is None and create:
+        attr = mesh.attributes.new(
+            name=PBA_VERTEX_ID_ATTR, type='INT', domain='POINT')
+    return attr
+
+
+def get_vertex_uuid(obj, vertex_index):
+    if vertex_index < 0:
+        return 0
+
+    # Edit Mode — читаем через bmesh
+    if (bpy.context.mode == 'EDIT_MESH'
+            and bpy.context.active_object == obj):
+        bm = bmesh.from_edit_mesh(obj.data)
+        layer = bm.verts.layers.int.get(PBA_VERTEX_ID_ATTR)
+        if layer is None:
+            return 0
+        bm.verts.ensure_lookup_table()
+        if vertex_index >= len(bm.verts):
+            return 0
+        return int(bm.verts[vertex_index][layer])
+
+    # Object Mode — обычный путь
+    attr = _get_uuid_attr(obj.data, create=False)
+    if attr is None or len(attr.data) == 0:
+        return 0
+    n = len(obj.data.vertices)
+    if vertex_index >= n:
+        return 0
+    try:
+        return int(attr.data[vertex_index].value)
+    except Exception:
+        return 0
+
+
+def find_vertex_by_uuid(obj, uuid_val, hint_world=None):
+    if uuid_val <= 0:
+        return -1, 0
+
+    if (bpy.context.mode == 'EDIT_MESH'
+            and bpy.context.active_object == obj):
+        bm = bmesh.from_edit_mesh(obj.data)
+        layer = bm.verts.layers.int.get(PBA_VERTEX_ID_ATTR)
+        if layer is None:
+            return -1, 0
+        bm.verts.ensure_lookup_table()
+        candidates = [i for i, v in enumerate(bm.verts)
+                      if int(v[layer]) == uuid_val]
+    else:
+        attr = _get_uuid_attr(obj.data, create=False)
+        if attr is None or len(attr.data) == 0:
+            return -1, 0
+        n = min(len(obj.data.vertices), len(attr.data))
+        candidates = []
+        for i in range(n):
+            try:
+                if int(attr.data[i].value) == uuid_val:
+                    candidates.append(i)
+            except Exception:
+                continue
+
+    if not candidates:
+        return -1, 0
+    if len(candidates) == 1:
+        return candidates[0], 1
+
+    if hint_world is not None:
+        M = obj.matrix_world
+        hint = Vector(hint_world)
+        best_i = candidates[0]
+        best_d = float('inf')
+        for i in candidates:
+            p = M @ obj.data.vertices[i].co
+            d = (p - hint).length
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return best_i, len(candidates)
+
+    return candidates[0], len(candidates)
 
 
 PLANE_MESH_NAME = "PBA_LayoutMesh"
@@ -820,6 +905,7 @@ class PBA_LM_OT_capture_3d(bpy.types.Operator):
             c = pba.pending_corners_3d.add()
             c.obj_name = obj.name
             c.vertex_index = v.index
+            c.vertex_uuid = get_vertex_uuid(obj, v.index)
             c.x_world = (wp.x, wp.y, wp.z)
 
         ids = [f"v{selected[i].index}" for i in order]
@@ -974,6 +1060,7 @@ def _commit_quad(scene):
         nc.obj_name = c.obj_name
         nc.vertex_index = c.vertex_index
         nc.x_world = c.x_world
+        nc.vertex_uuid = c.vertex_uuid
 
     flat = []
     for (x, y) in pts_sorted:
@@ -1069,13 +1156,16 @@ class PBA_LM_OT_export_json(bpy.types.Operator):
         for q in pba.quads:
             corners_3d = []
             for c in q.corners_3d:
-                corners_3d.append({
+                item = {
                     "obj": c.obj_name,
                     "vertex": c.vertex_index,
                     "x_world": [float(c.x_world[0]),
                                  float(c.x_world[1]),
                                  float(c.x_world[2])],
-                })
+                }
+                if c.vertex_uuid > 0:
+                    item["vertex_uuid"] = int(c.vertex_uuid)
+                corners_3d.append(item)
             px = list(q.corners_px)
             corners_px = [[px[0], px[1]], [px[2], px[3]],
                           [px[4], px[5]], [px[6], px[7]]]
@@ -1090,14 +1180,17 @@ class PBA_LM_OT_export_json(bpy.types.Operator):
         for isl in pba.islands:
             corners = []
             for c in isl.corners:
-                corners.append({
+                item = {
                     "obj": c.obj_name,
                     "vertex": c.vertex_index,
                     "uv": [float(c.uv[0]), float(c.uv[1])],
                     "x_world": [float(c.x_world[0]),
                                  float(c.x_world[1]),
                                  float(c.x_world[2])],
-                })
+                }
+                if c.vertex_uuid > 0:
+                    item["vertex_uuid"] = int(c.vertex_uuid)
+                corners.append(item)
             px = list(isl.corners_layout_px)
             corners_px = [[px[0], px[1]], [px[2], px[3]],
                           [px[4], px[5]], [px[6], px[7]]]
@@ -1387,7 +1480,7 @@ class PBA_LM_OT_flip_quad(bpy.types.Operator):
 class PBA_LM_OT_import_json(bpy.types.Operator):
     bl_idname = "pba_lm.import_json"
     bl_label = "Import JSON"
-    bl_description = "Загрузить квады из JSON"
+    bl_description = "Загрузить квады и острова из JSON"
 
     filepath: bpy.props.StringProperty(subtype='FILE_PATH')
     filter_glob: bpy.props.StringProperty(
@@ -1412,17 +1505,47 @@ class PBA_LM_OT_import_json(bpy.types.Operator):
             self.report({'ERROR'}, f"Ошибка чтения: {e}")
             return {'CANCELLED'}
 
+        # --- Квады ---
         pba.quads.clear()
+        quads_missing = 0
         for qd in data.get("quads", []):
             q = pba.quads.add()
             q.id = qd.get("id", "")
             q.part = qd.get("part", "")
+            if "duplicate_of" in qd:
+                q.duplicate_of = qd["duplicate_of"]
+
             for cd in qd.get("corners_3d", []):
                 c = q.corners_3d.add()
                 c.obj_name = cd.get("obj", "")
                 c.vertex_index = int(cd.get("vertex", -1))
                 xw = cd.get("x_world", [0.0, 0.0, 0.0])
                 c.x_world = (float(xw[0]), float(xw[1]), float(xw[2]))
+
+                vuuid = int(cd.get("vertex_uuid", 0))
+                c.vertex_uuid = vuuid
+
+                if vuuid > 0:
+                    obj = scene.objects.get(c.obj_name)
+                    if obj is not None and obj.type == 'MESH':
+                        hint = (c.x_world[0],
+                                c.x_world[1],
+                                c.x_world[2])
+                        idx, n_cand = find_vertex_by_uuid(
+                            obj, vuuid, hint_world=hint)
+                        if idx >= 0:
+                            c.vertex_index = idx
+                            if n_cand > 1:
+                                print(f"[PBA LM] {q.id}: "
+                                      f"{c.obj_name} uuid={vuuid} — "
+                                      f"{n_cand} вершин, "
+                                      f"выбрана ближайшая")
+                        else:
+                            quads_missing += 1
+                            print(f"[PBA LM] {q.id}: "
+                                  f"{c.obj_name} uuid={vuuid} "
+                                  f"не найден")
+
             px_list = qd.get("corners_layout_px", [])
             flat = [0.0] * 8
             for i, pt in enumerate(px_list[:4]):
@@ -1430,14 +1553,99 @@ class PBA_LM_OT_import_json(bpy.types.Operator):
                 flat[i * 2 + 1] = float(pt[1])
             q.corners_px = tuple(flat)
 
-        pba.quad_counter = len(pba.quads)
+        # --- Острова ---
+        pba.islands.clear()
+        islands_missing = 0
+        for idata in data.get("islands", []):
+            isl = pba.islands.add()
+            isl.id = idata.get("id", "")
+            isl.part = idata.get("part", "")
+            if "duplicate_of" in idata:
+                isl.duplicate_of = idata["duplicate_of"]
+
+            for cd in idata.get("corners", []):
+                c = isl.corners.add()
+                c.obj_name = cd.get("obj", "")
+                c.vertex_index = int(cd.get("vertex", -1))
+                uv = cd.get("uv", [0.0, 0.0])
+                c.uv = (float(uv[0]), float(uv[1]))
+                xw = cd.get("x_world", [0.0, 0.0, 0.0])
+                c.x_world = (float(xw[0]), float(xw[1]), float(xw[2]))
+
+                # uv_candidates может отсутствовать в старых файлах
+                uvc = cd.get("uv_candidates", [])
+                if uvc:
+                    n = min(len(uvc) // 2, 8)
+                    arr = [0.0] * 16
+                    for k in range(n):
+                        arr[k * 2] = float(uvc[k * 2])
+                        arr[k * 2 + 1] = float(uvc[k * 2 + 1])
+                    c.uv_candidates = tuple(arr)
+                    c.n_uv_candidates = n
+                else:
+                    c.n_uv_candidates = 0
+
+                vuuid = int(cd.get("vertex_uuid", 0))
+                c.vertex_uuid = vuuid
+                if "fit_residual" in cd:
+                    c.fit_residual = float(cd["fit_residual"])
+
+                if vuuid > 0:
+                    obj = scene.objects.get(c.obj_name)
+                    if obj is not None and obj.type == 'MESH':
+                        hint = (c.x_world[0],
+                                c.x_world[1],
+                                c.x_world[2])
+                        idx, n_cand = find_vertex_by_uuid(
+                            obj, vuuid, hint_world=hint)
+                        if idx >= 0:
+                            c.vertex_index = idx
+                            if n_cand > 1:
+                                print(f"[PBA LM] {isl.id}: "
+                                      f"{c.obj_name} uuid={vuuid} — "
+                                      f"{n_cand} вершин, "
+                                      f"выбрана ближайшая")
+                        else:
+                            islands_missing += 1
+                            print(f"[PBA LM] {isl.id}: "
+                                  f"{c.obj_name} uuid={vuuid} "
+                                  f"не найден")
+
+            px_list = idata.get("corners_layout_px", [])
+            flat = [0.0] * 8
+            for i, pt in enumerate(px_list[:4]):
+                flat[i * 2] = float(pt[0])
+                flat[i * 2 + 1] = float(pt[1])
+            isl.corners_layout_px = tuple(flat)
+
+        # Счётчики
+        pba.quad_counter = max(
+            (int(q.id.split("_")[-1]) for q in pba.quads
+             if q.id.startswith("q_") and q.id.split("_")[-1].isdigit()),
+            default=0)
+        pba.island_counter = max(
+            (int(i.id.split("_")[-1]) for i in pba.islands
+             if i.id.startswith("i_") and i.id.split("_")[-1].isdigit()),
+            default=0)
+
         pba.active_quad_index = 0 if pba.quads else -1
 
+        # Визуализация
         _rebuild_committed_mesh(scene)
-        _set_status(scene, f"Загружено квадов: {len(pba.quads)}")
-        self.report({'INFO'}, f"Загружено: {len(pba.quads)}")
-        return {'FINISHED'}
+        _rebuild_pending_mesh(scene)
 
+        # Статус
+        parts = [f"Квадов: {len(pba.quads)}, "
+                 f"островов: {len(pba.islands)}"]
+        if quads_missing:
+            parts.append(f"потеряно углов квадов: {quads_missing}")
+        if islands_missing:
+            parts.append(f"потеряно углов островов: {islands_missing}")
+        msg = ", ".join(parts)
+        _set_status(scene, msg)
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+        
 
 class PBA_LM_OT_set_active_quad(bpy.types.Operator):
     bl_idname = "pba_lm.set_active_quad"
@@ -1457,7 +1665,7 @@ class PBA_LM_OT_set_active_quad(bpy.types.Operator):
 class PBA_LM_OT_refresh_highlight(bpy.types.Operator):
     bl_idname = "pba_lm.refresh_highlight"
     bl_label = "Refresh Highlight"
-    bl_description = "Перестроить маркеры активного квада"
+    bl_description = "Перестроить маркеры активного квада или острова"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -1470,28 +1678,62 @@ class PBA_LM_OT_refresh_highlight(bpy.types.Operator):
         pba.highlight_layout_obj = ""
         pba.highlight_model_obj = ""
 
-        idx = pba.active_quad_index
-        if not (0 <= idx < len(pba.quads)):
+        # Определяем, что показывать: остров или квад
+        corners_world = []
+        corners_px = None
+        label = ""
+
+        if 0 <= pba.active_island_index < len(pba.islands):
+            isl = pba.islands[pba.active_island_index]
+            label = f"Остров {isl.id}"
+            px = list(isl.corners_layout_px)
+            corners_px = [(px[0], px[1]), (px[2], px[3]),
+                          (px[4], px[5]), (px[6], px[7])]
+            for c in isl.corners:
+                obj = scene.objects.get(c.obj_name)
+                if (obj is not None and obj.type == 'MESH'
+                        and 0 <= c.vertex_index < len(obj.data.vertices)):
+                    v = obj.data.vertices[c.vertex_index]
+                    p = obj.matrix_world @ v.co
+                    corners_world.append((p.x, p.y, p.z))
+                else:
+                    corners_world.append((c.x_world[0],
+                                           c.x_world[1],
+                                           c.x_world[2]))
+        elif 0 <= pba.active_quad_index < len(pba.quads):
+            q = pba.quads[pba.active_quad_index]
+            label = f"Квад {q.id}"
+            px = list(q.corners_px)
+            corners_px = [(px[0], px[1]), (px[2], px[3]),
+                          (px[4], px[5]), (px[6], px[7])]
+            for c in q.corners_3d:
+                obj = scene.objects.get(c.obj_name)
+                if (obj is not None and obj.type == 'MESH'
+                        and 0 <= c.vertex_index < len(obj.data.vertices)):
+                    v = obj.data.vertices[c.vertex_index]
+                    p = obj.matrix_world @ v.co
+                    corners_world.append((p.x, p.y, p.z))
+                else:
+                    corners_world.append((c.x_world[0],
+                                           c.x_world[1],
+                                           c.x_world[2]))
+        else:
             return {'FINISHED'}
 
-        q = pba.quads[idx]
         size = pba.highlight_size
 
-        # --- Маркеры на выкройке (крестики) ---
+        # --- Маркеры на выкройке ---
         plane = _get_plane(scene)
         img = _get_layout_image(scene)
-        if plane is not None and img is not None:
+        if plane is not None and img is not None and corners_px is not None:
             W_px, H_px = img.size
-            px = list(q.corners_px)
             plane_y = plane.matrix_world.translation.y
             cross_y = plane_y - 0.01
 
             all_verts = []
             all_faces = []
             colors = []
-            for corner_i in range(4):
-                cx_px = px[corner_i * 2]
-                cy_px = px[corner_i * 2 + 1]
+            for corner_i, (cx_px, cy_px) in enumerate(corners_px):
                 w = _pixel_to_world(plane, cx_px, cy_px, W_px, H_px)
                 if w is None:
                     continue
@@ -1506,7 +1748,8 @@ class PBA_LM_OT_refresh_highlight(bpy.types.Operator):
                     colors.append(CORNER_COLORS[corner_i])
 
             if all_verts:
-                mesh = bpy.data.meshes.new(HIGHLIGHT_LAYOUT_NAME + "_mesh")
+                mesh = bpy.data.meshes.new(
+                    HIGHLIGHT_LAYOUT_NAME + "_mesh")
                 mesh.from_pydata(all_verts, [], all_faces)
                 mesh.update()
                 _apply_colors(mesh, colors)
@@ -1516,24 +1759,7 @@ class PBA_LM_OT_refresh_highlight(bpy.types.Operator):
                     _ensure_color_material("PBA_LM_HighlightMat"))
                 pba.highlight_layout_obj = obj.name
 
-        # --- Маркеры на 3D-модели (октаэдры) + рёбра ---
-        corners_world = []
-        missing = []
-        for c in q.corners_3d:
-            obj = scene.objects.get(c.obj_name)
-            if (obj is not None and obj.type == 'MESH'
-                    and 0 <= c.vertex_index < len(obj.data.vertices)):
-                v = obj.data.vertices[c.vertex_index]
-                p = obj.matrix_world @ v.co
-                corners_world.append((p.x, p.y, p.z))
-            else:
-                # Fallback: сохранённые координаты из JSON
-                corners_world.append((c.x_world[0],
-                                       c.x_world[1],
-                                       c.x_world[2]))
-                missing.append(c.obj_name)
-                missing.append(c.obj_name)
-
+        # --- Маркеры на 3D-модели ---
         if len(corners_world) == 4:
             all_verts = []
             all_faces = []
@@ -1548,14 +1774,9 @@ class PBA_LM_OT_refresh_highlight(bpy.types.Operator):
                 for _ in range(len(v)):
                     colors.append(CORNER_COLORS[corner_i])
 
-            # Рёбра контура квада — тонкие линии
-            # Добавим их как маленькие "трубки" — упрощённо, как два
-            # тонких четырёхугольника вдоль каждого ребра.
-            # Для простоты — только контур, без толщины, как wireframe edges.
-            edges_for_wire = [(0, 1), (1, 2), (2, 3), (3, 0)]
-
             if all_verts:
-                mesh = bpy.data.meshes.new(HIGHLIGHT_MODEL_NAME + "_mesh")
+                mesh = bpy.data.meshes.new(
+                    HIGHLIGHT_MODEL_NAME + "_mesh")
                 mesh.from_pydata(all_verts, [], all_faces)
                 mesh.update()
                 _apply_colors(mesh, colors)
@@ -1565,14 +1786,8 @@ class PBA_LM_OT_refresh_highlight(bpy.types.Operator):
                     _ensure_color_material("PBA_LM_HighlightMat"))
                 pba.highlight_model_obj = obj.name
 
-        status_tail = ""
-        if missing:
-            status_tail = f" (не найдены: {', '.join(set(missing))})"
-
-        _set_status(
-            scene,
-            f"Активный квад {q.id}: маркеры по текущему положению "
-            f"вершин (R=0, G=1, B=2, Y=3){status_tail}")
+        _set_status(scene,
+                    f"{label}: маркеры показаны (R=0, G=1, B=2, Y=3)")
         return {'FINISHED'}
 
 
@@ -1695,6 +1910,7 @@ class PBA_LM_OT_pick_island_vertices(bpy.types.Operator):
             c = pba.pending_island_corners.add()
             c.obj_name = obj.name
             c.vertex_index = vi
+            c.vertex_uuid = get_vertex_uuid(obj, vi)
             n = min(len(uvs), 8)
             c.n_uv_candidates = n
             arr = [0.0] * 16
@@ -1786,6 +2002,7 @@ def _commit_island(scene):
         nc = isl.corners.add()
         nc.obj_name = c.obj_name
         nc.vertex_index = c.vertex_index
+        nc.vertex_uuid = c.vertex_uuid
         nc.uv = (c.uv[0], c.uv[1])
         nc.x_world = (c.x_world[0], c.x_world[1], c.x_world[2])
         nc.uv_candidates = tuple(c.uv_candidates)
@@ -1860,7 +2077,7 @@ class PBA_LM_OT_rotate_island(bpy.types.Operator):
         isl.corners_layout_px = tuple(flat)
 
         _set_status(context.scene,
-                    f"Остров {isl.id}: поворот {self.target}")
+                    f"Остров {isl.id}: поворот 2D-кликов")
         return {'FINISHED'}
 
 
@@ -1887,7 +2104,7 @@ class PBA_LM_OT_flip_island(bpy.types.Operator):
         isl.corners_layout_px = tuple(flat)
 
         _set_status(context.scene,
-                    f"Остров {isl.id}: отражение {self.target}")
+                    f"Остров {isl.id}: отражение  2D-кликов")
         return {'FINISHED'}
 
 class PBA_LM_OT_duplicate_quad(bpy.types.Operator):
@@ -2008,6 +2225,23 @@ class PBA_LM_OT_clear_islands(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class PBA_LM_OT_set_active_island(bpy.types.Operator):
+    bl_idname = "pba_lm.set_active_island"
+    bl_label = "Set Active Island"
+    bl_options = {'INTERNAL'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        if 0 <= self.index < len(pba.islands):
+            pba.active_island_index = self.index
+            # Сбрасываем активный квад, чтобы не путать визуализацию
+            pba.active_quad_index = -1
+            return bpy.ops.pba_lm.refresh_highlight()
+        return {'CANCELLED'}
+
+
 classes = (
     PBA_LM_OT_load_layout,
     PBA_LM_OT_capture_3d,
@@ -2035,4 +2269,5 @@ classes = (
     PBA_LM_OT_clear_islands,
     PBA_LM_OT_rotate_island,
     PBA_LM_OT_flip_island,
+    PBA_LM_OT_set_active_island
 )

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "PT Photo Mapper",
     "author": "PaperTrolley",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > PT Model",
     "description": "Загружает фото, настраивает камеру, сохраняет "
@@ -16,6 +16,7 @@ from . import ops, panel
 
 class PBA_VM_Correspondence(bpy.types.PropertyGroup):
     obj_name: bpy.props.StringProperty(default="")
+    vertex_uuid: bpy.props.IntProperty(default=0)
     vertex_index: bpy.props.IntProperty(default=-1)
     x3d: bpy.props.FloatVectorProperty(size=3, default=(0.0, 0.0, 0.0))
     x2d: bpy.props.FloatVectorProperty(size=2, default=(0.0, 0.0))
@@ -58,6 +59,7 @@ class PBA_VM_Props(bpy.types.PropertyGroup):
     pending_x2d: bpy.props.FloatVectorProperty(size=2, default=(0.0, 0.0))
     pending_3d_obj: bpy.props.StringProperty(default="")
     pending_3d_vertex: bpy.props.IntProperty(default=-1)
+    pending_3d_uuid: bpy.props.IntProperty(default=0)
     pending_3d_set: bpy.props.BoolProperty(default=False)
     pending_2d_set: bpy.props.BoolProperty(default=False)
     

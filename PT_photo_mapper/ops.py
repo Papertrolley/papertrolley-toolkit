@@ -13,6 +13,95 @@ from bpy_extras.view3d_utils import region_2d_to_vector_3d
 
 from .exif import camera_params, read_exif, to_float, detect_native_resolution
 
+PBA_VERTEX_ID_ATTR = "pba_vertex_id"
+
+
+def get_uuid_attribute(mesh, create=False):
+    attr = mesh.attributes.get(PBA_VERTEX_ID_ATTR)
+    if attr is None and create:
+        attr = mesh.attributes.new(
+            name=PBA_VERTEX_ID_ATTR, type='INT', domain='POINT')
+    return attr
+
+
+def _get_uuid_layer_from_bmesh(obj):
+    import bmesh
+    bm = bmesh.from_edit_mesh(obj.data)
+    return bm, bm.verts.layers.int.get(PBA_VERTEX_ID_ATTR)
+
+
+def get_vertex_uuid(obj, vertex_index):
+    # Edit Mode: читаем через bmesh
+    if (bpy.context.mode == 'EDIT_MESH'
+            and bpy.context.active_object == obj):
+        bm, layer = _get_uuid_layer_from_bmesh(obj)
+        if layer is None:
+            return 0
+        bm.verts.ensure_lookup_table()
+        if vertex_index < 0 or vertex_index >= len(bm.verts):
+            return 0
+        return int(bm.verts[vertex_index][layer])
+
+    # Object Mode: обычный путь
+    attr = get_uuid_attribute(obj.data, create=False)
+    if attr is None or len(attr.data) == 0:
+        return 0
+    n = len(obj.data.vertices)
+    if vertex_index < 0 or vertex_index >= n:
+        return 0
+    try:
+        return int(attr.data[vertex_index].value)
+    except Exception:
+        return 0
+
+
+def find_vertex_by_uuid(obj, uuid_val, hint_world=None):
+    if uuid_val <= 0:
+        return -1, 0
+
+    # Собираем UUID всех вершин
+    if (bpy.context.mode == 'EDIT_MESH'
+            and bpy.context.active_object == obj):
+        bm, layer = _get_uuid_layer_from_bmesh(obj)
+        if layer is None:
+            return -1, 0
+        bm.verts.ensure_lookup_table()
+        candidates = [i for i, v in enumerate(bm.verts)
+                      if int(v[layer]) == uuid_val]
+    else:
+        attr = get_uuid_attribute(obj.data, create=False)
+        if attr is None or len(attr.data) == 0:
+            return -1, 0
+        n = min(len(obj.data.vertices), len(attr.data))
+        candidates = []
+        for i in range(n):
+            try:
+                if int(attr.data[i].value) == uuid_val:
+                    candidates.append(i)
+            except Exception:
+                continue
+
+    if not candidates:
+        return -1, 0
+    if len(candidates) == 1:
+        return candidates[0], 1
+
+    if hint_world is not None:
+        M = obj.matrix_world
+        hint = Vector(hint_world)
+        best_i = candidates[0]
+        best_d = float('inf')
+        for i in candidates:
+            p = M @ obj.data.vertices[i].co
+            d = (p - hint).length
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return best_i, len(candidates)
+
+    return candidates[0], len(candidates)
+
+
 DEFAULT_LENS_MM = 50.0
 DEFAULT_SENSOR_MM = 36.0
 
@@ -72,7 +161,7 @@ def _build_json_data(scene, path, W, H, cam_obj):
 
     corrs_data = []
     for i, c in enumerate(pba.correspondences):
-        corrs_data.append({
+        item = {
             "index": i,
             "obj": c.obj_name,
             "vertex": int(c.vertex_index),
@@ -80,7 +169,10 @@ def _build_json_data(scene, path, W, H, cam_obj):
             "x2d": [float(c.x2d[0]), float(c.x2d[1])],
             "enabled": bool(c.enabled),
             "last_error_px": float(c.last_error),
-        })
+        }
+        if c.vertex_uuid > 0:
+            item["vertex_uuid"] = int(c.vertex_uuid)
+        corrs_data.append(item)
 
     active = [c for c in pba.correspondences if c.enabled]
     errors = [c.last_error for c in active if c.last_error >= 0.0]
@@ -95,8 +187,8 @@ def _build_json_data(scene, path, W, H, cam_obj):
         rmse = 0.0
 
     return {
-        "format_version": "1.0",
-        "generator": "PBA Vertex Mapper 0.3.0",
+        "format_version": "1.1",
+        "generator": "PBA Vertex Mapper 0.4.0",
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "photo": {
             "path": path,
@@ -191,23 +283,53 @@ def _apply_json_data(scene, data, path, W, H, cam_obj):
     pba.correspondences.clear()
     restored = 0
     skipped = 0
+    skipped_uuid = 0
+    dupes_resolved = 0
     for cd in data.get("correspondences", []):
         obj_name = cd.get("obj", "")
+        vertex_uuid = int(cd.get("vertex_uuid", 0))
         vertex_idx = int(cd.get("vertex", -1))
+
         obj = scene.objects.get(obj_name)
         if obj is None or obj.type != 'MESH':
-            logger.warning(f"Пропуск: объект '{obj_name}' не найден")
-            skipped += 1
-            continue
-        if vertex_idx < 0 or vertex_idx >= len(obj.data.vertices):
-            logger.warning(f"Пропуск: вершина {vertex_idx} вне "
-                           f"диапазона объекта '{obj_name}'")
+            print(f"[PBA VM] пропуск: объект '{obj_name}' не найден")
             skipped += 1
             continue
 
+        # Приоритет — UUID
+        resolved_idx = -1
+        if vertex_uuid > 0:
+            hint = None
+            x3d_raw = cd.get("x3d")
+            if x3d_raw and len(x3d_raw) == 3:
+                hint = (float(x3d_raw[0]),
+                        float(x3d_raw[1]),
+                        float(x3d_raw[2]))
+            resolved_idx, n_cand = find_vertex_by_uuid(
+                obj, vertex_uuid, hint_world=hint)
+            if resolved_idx < 0:
+                print(f"[PBA VM] пропуск: {obj_name} "
+                      f"uuid={vertex_uuid} не найден")
+                skipped_uuid += 1
+                continue
+            if n_cand > 1:
+                dupes_resolved += 1
+                print(f"[PBA VM] {obj_name} uuid={vertex_uuid}: "
+                      f"{n_cand} вершин, выбрана ближайшая к x3d")
+        else:
+            if 0 <= vertex_idx < len(obj.data.vertices):
+                resolved_idx = vertex_idx
+            else:
+                print(f"[PBA VM] пропуск: {obj_name} "
+                      f"v{vertex_idx} вне диапазона "
+                      f"({len(obj.data.vertices)} вершин)")
+                skipped += 1
+                continue
+
         c = pba.correspondences.add()
         c.obj_name = obj_name
-        c.vertex_index = vertex_idx
+        c.vertex_index = resolved_idx
+        c.vertex_uuid = vertex_uuid
         x3d = cd.get("x3d", [0.0, 0.0, 0.0])
         c.x3d[0] = float(x3d[0])
         c.x3d[1] = float(x3d[1])
@@ -220,9 +342,16 @@ def _apply_json_data(scene, data, path, W, H, cam_obj):
         restored += 1
 
     rmse = float(solve.get("rmse_px", 0.0))
-    msg = (f"Восстановлено: {restored} пар"
-           + (f", пропущено {skipped}" if skipped else "")
-           + (f", RMSE {rmse:.2f}px" if rmse > 0 else ""))
+    parts = [f"Восстановлено: {restored} пар"]
+    if skipped:
+        parts.append(f"пропущено {skipped}")
+    if skipped_uuid:
+        parts.append(f"потеряно по UUID {skipped_uuid}")
+    if dupes_resolved:
+        parts.append(f"разрешено дубликатов {dupes_resolved}")
+    if rmse > 0:
+        parts.append(f"RMSE {rmse:.2f}px")
+    msg = ", ".join(parts)
     _set_status(scene, msg)
     logger.info(msg)
     return True
@@ -248,17 +377,59 @@ def _delete_old_camera(scene):
             bpy.data.cameras.remove(data)
 
 def _sync_x3d_from_mesh(scene):
-    """Обновляет x3d каждой пары из текущего положения вершин меша."""
+    """Обновляет x3d по актуальному положению вершин. Работает
+    по UUID (если есть) или по индексу. Пары с большим расхождением
+    не перезаписываются, а помечаются."""
+    import bmesh
     pba = scene.pba_vm
     updated = 0
+    suspicious = 0
+
+    edit_obj = None
+    bm = None
+    if bpy.context.mode == 'EDIT_MESH':
+        edit_obj = bpy.context.active_object
+        if edit_obj is not None and edit_obj.type == 'MESH':
+            bm = bmesh.from_edit_mesh(edit_obj.data)
+            bm.verts.ensure_lookup_table()
+
+    DRIFT_THRESHOLD = 0.20
+
     for c in pba.correspondences:
         obj = scene.objects.get(c.obj_name)
         if obj is None or obj.type != 'MESH':
             continue
-        if c.vertex_index < 0 or c.vertex_index >= len(obj.data.vertices):
+
+        if c.vertex_uuid > 0:
+            hint = (c.x3d[0], c.x3d[1], c.x3d[2])
+            idx, _ = find_vertex_by_uuid(obj, c.vertex_uuid,
+                                          hint_world=hint)
+            if idx < 0:
+                continue
+            if idx != c.vertex_index:
+                c.vertex_index = idx
+        else:
+            idx = c.vertex_index
+
+        if idx < 0 or idx >= len(obj.data.vertices):
             continue
-        v = obj.data.vertices[c.vertex_index]
-        p_world = obj.matrix_world @ v.co
+
+        if (edit_obj is not None and obj == edit_obj
+                and bm is not None and idx < len(bm.verts)):
+            co_local = bm.verts[idx].co
+        else:
+            co_local = obj.data.vertices[idx].co
+
+        p_world = obj.matrix_world @ co_local
+        old = Vector((c.x3d[0], c.x3d[1], c.x3d[2]))
+        drift = (p_world - old).length
+
+        if drift > DRIFT_THRESHOLD:
+            suspicious += 1
+            print(f"[PBA VM] ПОДОЗРИТЕЛЬНО: {c.obj_name} "
+                  f"uuid={c.vertex_uuid} v{idx} — сдвиг {drift:.3f} м")
+            continue
+
         if (abs(c.x3d[0] - p_world.x) > 1e-9
                 or abs(c.x3d[1] - p_world.y) > 1e-9
                 or abs(c.x3d[2] - p_world.z) > 1e-9):
@@ -266,7 +437,11 @@ def _sync_x3d_from_mesh(scene):
             c.x3d[1] = p_world.y
             c.x3d[2] = p_world.z
             updated += 1
+
+    if suspicious > 0:
+        print(f"[PBA VM] ВНИМАНИЕ: {suspicious} пар с большим сдвигом.")
     return updated
+
 
 class PBA_VM_OT_load_photo(bpy.types.Operator):
     bl_idname = "pba_vm.load_photo"
@@ -570,12 +745,17 @@ def _commit_pair(scene):
 
     # Дубликат 3D-вершины
     for existing in pba.correspondences:
-        if (existing.obj_name == pba.pending_3d_obj
-                and existing.vertex_index == pba.pending_3d_vertex):
+        same_uuid = (pba.pending_3d_uuid > 0
+                     and existing.vertex_uuid == pba.pending_3d_uuid)
+        same_idx = (pba.pending_3d_uuid == 0
+                    and existing.obj_name == pba.pending_3d_obj
+                    and existing.vertex_index == pba.pending_3d_vertex)
+        if existing.obj_name == pba.pending_3d_obj and (same_uuid or same_idx):
             pba.pending_3d_set = False
             pba.pending_2d_set = False
             pba.pending_3d_obj = ""
             pba.pending_3d_vertex = -1
+            pba.pending_3d_uuid = 0
             print(f"[PBA VM] пропущен дубликат 3D: "
                   f"{existing.obj_name} v{existing.vertex_index}")
             return
@@ -590,13 +770,12 @@ def _commit_pair(scene):
         if dist < 5.0:
             print(f"[PBA VM] ВНИМАНИЕ: 2D-клик ({px:.1f},{py:.1f}) "
                   f"в {dist:.1f}px от пары "
-                  f"{existing.obj_name} v{existing.vertex_index} "
-                  f"({existing.x2d[0]:.1f},{existing.x2d[1]:.1f}). "
-                  f"Возможно, дубликат.")
+                  f"{existing.obj_name} v{existing.vertex_index}")
 
     c = pba.correspondences.add()
     c.obj_name = pba.pending_3d_obj
     c.vertex_index = pba.pending_3d_vertex
+    c.vertex_uuid = pba.pending_3d_uuid
     c.x3d = pba.pending_x3d
     c.x2d = pba.pending_x2d
 
@@ -604,6 +783,7 @@ def _commit_pair(scene):
     pba.pending_2d_set = False
     pba.pending_3d_obj = ""
     pba.pending_3d_vertex = -1
+    pba.pending_3d_uuid = 0
 
 
 class PBA_VM_OT_pick_3d(bpy.types.Operator):
@@ -631,10 +811,17 @@ class PBA_VM_OT_pick_3d(bpy.types.Operator):
         v = selected[0]
         p_world = obj.matrix_world @ v.co
         pba = scene.pba_vm
+        uuid_val = get_vertex_uuid(obj, v.index)
         pba.pending_x3d = (p_world.x, p_world.y, p_world.z)
         pba.pending_3d_obj = obj.name
         pba.pending_3d_vertex = v.index
+        pba.pending_3d_uuid = uuid_val
         pba.pending_3d_set = True
+
+        if uuid_val == 0:
+            print(f"[PBA VM] ВНИМАНИЕ: у вершины {obj.name} "
+                  f"v{v.index} нет UUID. Запустите Assign UUIDs "
+                  f"в PBA UV Exporter.")
 
         _commit_pair(scene)
         _set_status(scene, f"3D: {obj.name} v{v.index} = "

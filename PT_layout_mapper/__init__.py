@@ -1,7 +1,7 @@
 bl_info = {
     "name": "PT Layout Mapper",
     "author": "PaperTrolley",
-    "version": (0, 1, 0),
+    "version": (0, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > PT Model",
     "description": "Разметка соответствий между 4 вершинами 3D-модели "
@@ -18,6 +18,7 @@ class PBA_LM_Corner3D(bpy.types.PropertyGroup):
     obj_name: bpy.props.StringProperty(default="")
     vertex_index: bpy.props.IntProperty(default=-1)
     x_world: bpy.props.FloatVectorProperty(size=3, default=(0.0, 0.0, 0.0))
+    vertex_uuid: bpy.props.IntProperty(default=0)
 
 
 class PBA_LM_Quad(bpy.types.PropertyGroup):
@@ -36,6 +37,7 @@ class PBA_LM_IslandCorner(bpy.types.PropertyGroup):
         size=16, default=(0.0,) * 16)
     n_uv_candidates: bpy.props.IntProperty(default=0)
     fit_residual: bpy.props.FloatProperty(default=-1.0)
+    vertex_uuid: bpy.props.IntProperty(default=0)
 
 
 class PBA_LM_Island(bpy.types.PropertyGroup):
@@ -109,7 +111,8 @@ class PBA_LM_Props(bpy.types.PropertyGroup):
     pending_island_uv_name: bpy.props.StringProperty(default="")
     pending_island_corners: bpy.props.CollectionProperty(
         type=PBA_LM_IslandCorner)
-
+    active_island_index: bpy.props.IntProperty(default=-1)
+    
 
 classes = (
     PBA_LM_Corner3D, PBA_LM_Quad,

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "PT Triangulation",
     "author": "PaperTroley",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > PT Model",
     "description": "Триангуляция 3D-точек по нескольким калиброванным фото",
@@ -21,7 +21,9 @@ class PBA_TRI_Click(bpy.types.PropertyGroup):
 class PBA_TRI_Correspondence(bpy.types.PropertyGroup):
     obj_name: bpy.props.StringProperty(default="")
     vertex_index: bpy.props.IntProperty(default=-1)
+    vertex_uuid: bpy.props.IntProperty(default=0)
     x2d: bpy.props.FloatVectorProperty(size=2, default=(0.0, 0.0))
+    x_world: bpy.props.FloatVectorProperty(size=3, default=(0.0, 0.0, 0.0))
     enabled: bpy.props.BoolProperty(default=True)
 
 

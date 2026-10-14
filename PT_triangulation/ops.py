@@ -12,6 +12,89 @@ from bpy_extras.object_utils import world_to_camera_view
 from .core import make_P, triangulate
 
 
+PBA_VERTEX_ID_ATTR = "pba_vertex_id"
+
+
+def _get_uuid_attr(mesh, create=False):
+    attr = mesh.attributes.get(PBA_VERTEX_ID_ATTR)
+    if attr is None and create:
+        attr = mesh.attributes.new(
+            name=PBA_VERTEX_ID_ATTR, type='INT', domain='POINT')
+    return attr
+
+
+def get_vertex_uuid(obj, vertex_index):
+    if vertex_index < 0:
+        return 0
+    if (bpy.context.mode == 'EDIT_MESH'
+            and bpy.context.active_object == obj):
+        bm = bmesh.from_edit_mesh(obj.data)
+        layer = bm.verts.layers.int.get(PBA_VERTEX_ID_ATTR)
+        if layer is None:
+            return 0
+        bm.verts.ensure_lookup_table()
+        if vertex_index >= len(bm.verts):
+            return 0
+        return int(bm.verts[vertex_index][layer])
+
+    attr = _get_uuid_attr(obj.data, create=False)
+    if attr is None or len(attr.data) == 0:
+        return 0
+    if vertex_index >= len(obj.data.vertices):
+        return 0
+    try:
+        return int(attr.data[vertex_index].value)
+    except Exception:
+        return 0
+
+
+def find_vertex_by_uuid(obj, uuid_val, hint_world=None):
+    if uuid_val <= 0:
+        return -1, 0
+
+    if (bpy.context.mode == 'EDIT_MESH'
+            and bpy.context.active_object == obj):
+        bm = bmesh.from_edit_mesh(obj.data)
+        layer = bm.verts.layers.int.get(PBA_VERTEX_ID_ATTR)
+        if layer is None:
+            return -1, 0
+        bm.verts.ensure_lookup_table()
+        candidates = [i for i, v in enumerate(bm.verts)
+                      if int(v[layer]) == uuid_val]
+    else:
+        attr = _get_uuid_attr(obj.data, create=False)
+        if attr is None or len(attr.data) == 0:
+            return -1, 0
+        n = min(len(obj.data.vertices), len(attr.data))
+        candidates = []
+        for i in range(n):
+            try:
+                if int(attr.data[i].value) == uuid_val:
+                    candidates.append(i)
+            except Exception:
+                continue
+
+    if not candidates:
+        return -1, 0
+    if len(candidates) == 1:
+        return candidates[0], 1
+
+    if hint_world is not None:
+        M = obj.matrix_world
+        hint = Vector(hint_world)
+        best_i = candidates[0]
+        best_d = float('inf')
+        for i in candidates:
+            p = M @ obj.data.vertices[i].co
+            d = (p - hint).length
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return best_i, len(candidates)
+
+    return candidates[0], len(candidates)
+
+
 OUTPUT_OBJ_NAME = "Triangulated_Points"
 CAM_NAME_TPL = "PBA_TRI_Cam_{}"
 
@@ -195,22 +278,48 @@ class PBA_TRI_OT_load_slot(bpy.types.Operator):
 
         # Соответствия
         slot.correspondences.clear()
+        missing_uuid = 0
         for cd in data.get("correspondences", []):
             if not cd.get("enabled", True):
                 continue
+            obj_name = cd.get("obj", "")
+            v_uuid = int(cd.get("vertex_uuid", 0))
+            v_idx = int(cd.get("vertex", -1))
+            xw_raw = cd.get("x3d", [0.0, 0.0, 0.0])
+
+            # Восстановление индекса по UUID
+            resolved_idx = v_idx
+            if v_uuid > 0:
+                obj = scene.objects.get(obj_name)
+                if obj is not None and obj.type == 'MESH':
+                    hint = (float(xw_raw[0]), float(xw_raw[1]),
+                            float(xw_raw[2]))
+                    idx, n_cand = find_vertex_by_uuid(
+                        obj, v_uuid, hint_world=hint)
+                    if idx >= 0:
+                        resolved_idx = idx
+                    else:
+                        missing_uuid += 1
+                        print(f"[PBA TRI] {obj_name} uuid={v_uuid} "
+                              f"не найден в меше")
+
             c = slot.correspondences.add()
-            c.obj_name = cd.get("obj", "")
-            c.vertex_index = int(cd.get("vertex", -1))
+            c.obj_name = obj_name
+            c.vertex_index = resolved_idx
+            c.vertex_uuid = v_uuid
+            c.x_world = (float(xw_raw[0]), float(xw_raw[1]),
+                         float(xw_raw[2]))
             x2d = cd.get("x2d", [0.0, 0.0])
             c.x2d[0] = float(x2d[0])
             c.x2d[1] = float(x2d[1])
             c.enabled = True
 
         slot.loaded = True
+        tail = f", потеряно по UUID {missing_uuid}" if missing_uuid else ""
         _set_status(scene,
                     f"Слот {self.slot_index + 1}: загружено "
                     f"{len(slot.correspondences)} пар, "
-                    f"{W}×{H}")
+                    f"{W}×{H}{tail}")
         return {'FINISHED'}
 
 
@@ -268,11 +377,15 @@ class PBA_TRI_OT_auto_triangulate(bpy.types.Operator):
         # Индексы слотов
         loaded_slots = [(i, s) for i, s in enumerate(p.photos) if s.loaded]
 
-        # Группируем по (obj_name, vertex_index)
+        # Группируем: приоритет по (obj_name, vertex_uuid),
+        # fallback по (obj_name, vertex_index)
         groups = {}
         for i, slot in loaded_slots:
             for c in slot.correspondences:
-                key = (c.obj_name, c.vertex_index)
+                if c.vertex_uuid > 0:
+                    key = (c.obj_name, "uuid", c.vertex_uuid)
+                else:
+                    key = (c.obj_name, "idx", c.vertex_index)
                 groups.setdefault(key, []).append(
                     (i, (c.x2d[0], c.x2d[1])))
 
