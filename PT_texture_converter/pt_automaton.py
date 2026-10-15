@@ -98,10 +98,12 @@ def project_points(P, pts_xyz):
 # ===== UV-карта =====
 
 def load_obj(path):
-    """Читает OBJ. groups — список групп (имя, [face_indices])."""
+    """Читает OBJ. Для каждой группы запоминает отсортированный
+    список глобальных индексов вершин, чтобы корректно переводить
+    локальный индекс в глобальный."""
     vertices, uvs, faces = [], [], []
     groups = []
-    current = ("__default__", [])
+    current = {"name": "__default__", "face_indices": []}
     groups.append(current)
 
     with open(path, 'r', encoding='utf-8') as f:
@@ -124,10 +126,27 @@ def load_obj(path):
                     else:
                         face.append((int(tk) - 1, -1))
                 faces.append(face)
-                current[1].append(len(faces) - 1)
+                current["face_indices"].append(len(faces) - 1)
             elif line.startswith('o ') or line.startswith('g '):
-                current = (line.split(maxsplit=1)[1].strip(), [])
+                current = {"name": line.split(maxsplit=1)[1].strip(),
+                           "face_indices": []}
                 groups.append(current)
+
+    # Точный список индексов вершин для каждой группы
+    for g in groups:
+        used = set()
+        for fi in g["face_indices"]:
+            for (vi, _) in faces[fi]:
+                used.add(vi)
+        g["vert_indices"] = sorted(used)
+        g["vert_set"] = used
+        g["n_vertices"] = len(used)
+        if used:
+            g["vert_min"] = min(used)
+            g["vert_max"] = max(used)
+        else:
+            g["vert_min"] = 0
+            g["vert_max"] = -1
 
     return {
         "vertices": np.array(vertices, dtype=np.float64),
@@ -135,6 +154,22 @@ def load_obj(path):
         "faces": faces,
         "groups": groups,
     }
+
+
+def get_vertex_xyz(obj_data, obj_name, local_index):
+    """Ищет XYZ вершины по имени группы и индексу в Blender-меше."""
+    for g in obj_data["groups"]:
+        if g["name"] != obj_name:
+            continue
+        if local_index < 0:
+            return None
+        obj_idx = g["vert_min"] + local_index
+        if obj_idx not in g["vert_set"]:
+            return None
+        if 0 <= obj_idx < len(obj_data["vertices"]):
+            return obj_data["vertices"][obj_idx]
+        return None
+    return None
 
 
 # ===== Глубина точек =====
@@ -509,7 +544,7 @@ def process_islands(layout, uv_meta, obj_data, photos, output,
                   f"покрыто фото: {ok_px.sum()}")
                   
 
-def process_quads(layout, photos, output, W_out, H_out, verbose=False):
+def process_quads(layout, obj_data,  photos, output, W_out, H_out, verbose=False):
     for q in layout.get("quads", []):
         qid = q.get("id", "?")
         corners = q.get("corners_3d", [])
@@ -517,8 +552,21 @@ def process_quads(layout, photos, output, W_out, H_out, verbose=False):
         if len(corners) != 4 or len(layout_px) != 4:
             continue
 
-        # Собираем 3D-точки
-        pts3d = np.array([c["x_world"] for c in corners], dtype=np.float64)
+        # Собираем 3D-точки из OBJ
+        pts3d_list = []
+        missing = []
+        for c in corners:
+            obj_name = c.get("obj", "")
+            vi = int(c.get("vertex", -1))
+            xyz = get_vertex_xyz(obj_data, obj_name, vi)
+            if xyz is None:
+                missing.append(f"{obj_name} v{vi}")
+                pts3d_list.append(c.get("x_world", [0.0, 0.0, 0.0]))
+            else:
+                pts3d_list.append(xyz.tolist())
+        if missing:
+            print(f"  {qid}: не найдены в OBJ: {', '.join(missing)}")
+        pts3d = np.array(pts3d_list, dtype=np.float64)
 
         # Ищем фото, где все 4 угла видны
         # (упрощённо: где все точки попадают в кадр)
@@ -662,7 +710,7 @@ def transfer(layout_json, uv_json, obj_path, photo_pairs,
                     W_out, H_out, verbose=verbose)
 
     print("Обработка квадов...")
-    process_quads(layout, photos, output, W_out, H_out, verbose=verbose)
+    process_quads(layout, obj_data, photos, output, W_out, H_out, verbose=verbose)
 
     Image.fromarray(output, 'RGBA').save(output_png, 'PNG')
     print(f"Сохранено: {output_png}")
