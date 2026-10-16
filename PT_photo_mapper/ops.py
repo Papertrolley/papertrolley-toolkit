@@ -645,65 +645,6 @@ class PBA_VM_OT_save_vertices(bpy.types.Operator):
         if n > 0:
             print(f"[PBA VM] синхронизировано {n} 3D-координат")
 
-        # CSV (как раньше, для совместимости с transfer.py)
-        csv_path = os.path.join(out_dir, f"{base}.vertices.csv")
-        try:
-            with open(csv_path, 'w', encoding='utf-8') as f:
-                f.write("object,vertex,x_px,y_px,z_depth,"
-                        "in_frame,visible\n")
-                for obj in scene.objects:
-                    if obj.type != 'MESH':
-                        continue
-                    M = obj.matrix_world
-                    for v in obj.data.vertices:
-                        p_world = M @ v.co
-                        co = world_to_camera_view(scene, cam_obj, p_world)
-                        x_px = co.x * W
-                        y_px = (1.0 - co.y) * H
-                        z = co.z
-
-                        in_frame = 1 if (0.0 <= co.x <= 1.0
-                                         and 0.0 <= co.y <= 1.0
-                                         and z > 0.0) else 0
-                        if in_frame:
-                            in_frame_count += 1
-
-                        visible = 0
-                        if in_frame:
-                            if not self.check_visibility:
-                                visible = 1
-                            else:
-                                direction = p_world - cam_loc
-                                dist_to_vertex = direction.length
-                                if dist_to_vertex > 1e-9:
-                                    dir_norm = direction / dist_to_vertex
-                                    (hit, hit_loc, hit_n, hit_idx,
-                                     hit_obj, hit_mat) = scene.ray_cast(
-                                        depsgraph, cam_loc, dir_norm)
-                                    if not hit:
-                                        # Луч ни во что не попал —
-                                        # считаем вершину видимой.
-                                        visible = 1
-                                    else:
-                                        hit_dist = (hit_loc
-                                                    - cam_loc).length
-                                        eps = (VISIBILITY_EPS_REL
-                                               * dist_to_vertex)
-                                        if hit_dist >= dist_to_vertex - eps:
-                                            visible = 1
-                        if visible:
-                            visible_count += 1
-
-                        f.write(
-                            f"{obj.name},{v.index},"
-                            f"{x_px:.3f},{y_px:.3f},{z:.4f},"
-                            f"{in_frame},{visible}\n")
-                        total += 1
-        except Exception as e:
-            _set_status(scene, f"Ошибка записи CSV: {e}")
-            self.report({'ERROR'}, f"CSV: {e}")
-            return {'CANCELLED'}
-
         # JSON (новый формат)
         json_path = os.path.join(out_dir, f"{base}.vertices.json")
         try:
@@ -716,8 +657,8 @@ class PBA_VM_OT_save_vertices(bpy.types.Operator):
             return {'CANCELLED'}
         _set_status(
             scene,
-            f"Сохранено: {csv_path} и {json_path} (вершин: {total})")
-        self.report({'INFO'}, f"CSV + JSON: {base}")
+            f"Сохранено: {json_path} (вершин: {total})")
+        self.report({'INFO'}, f"JSON: {base}")
         return {'FINISHED'}
 
 

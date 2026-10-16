@@ -77,18 +77,26 @@ class PBA_LM_PT_main(bpy.types.Panel):
                                        text=label, icon=icon,
                                        emboss=active)
                 op_act.index = i
+                
+                op = row.operator("pba_lm.move_island_up", text="",
+                                  icon='TRIA_UP')
+                op.index = i
 
-                op = row.operator("pba_lm.rotate_island", text="↺",
+                op = row.operator("pba_lm.move_island_down", text="",
+                                  icon='TRIA_DOWN')
+                op.index = i
+
+                op = row.operator("pba_lm.rotate_island", text="",
                                   icon='LOOP_BACK')
                 op.index = i
                 op.direction = -1
 
-                op = row.operator("pba_lm.rotate_island", text="↻",
+                op = row.operator("pba_lm.rotate_island", text="",
                                   icon='LOOP_FORWARDS')
                 op.index = i
                 op.direction = 1
 
-                op = row.operator("pba_lm.flip_island", text="⇄",
+                op = row.operator("pba_lm.flip_island", text="",
                                   icon='ARROW_LEFTRIGHT')
                 op.index = i
 
@@ -159,17 +167,25 @@ class PBA_LM_PT_main(bpy.types.Panel):
                                            emboss=active)
                     op_act.index = i
 
-                    op = row.operator("pba_lm.rotate_quad", text="↺",
+                    op = row.operator("pba_lm.move_quad_up", text="",
+                                    icon='TRIA_UP')
+                    op.index = i
+
+                    op = row.operator("pba_lm.move_quad_down", text="",
+                                    icon='TRIA_DOWN')
+                    op.index = i
+
+                    op = row.operator("pba_lm.rotate_quad", text="",
                                       icon='LOOP_BACK')
                     op.index = i
                     op.direction = -1
 
-                    op = row.operator("pba_lm.rotate_quad", text="↻",
+                    op = row.operator("pba_lm.rotate_quad", text="",
                                       icon='LOOP_FORWARDS')
                     op.index = i
                     op.direction = 1
 
-                    op = row.operator("pba_lm.flip_quad", text="⇄",
+                    op = row.operator("pba_lm.flip_quad", text="",
                                       icon='ARROW_LEFTRIGHT')
                     op.index = i
 

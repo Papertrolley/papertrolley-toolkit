@@ -542,7 +542,7 @@ def process_islands(layout, uv_meta, obj_data, photos, output,
             print(f"  {isl_id} ({obj_name}): остров {T} треугольников, "
                   f"{filled.sum()} пикселей, "
                   f"покрыто фото: {ok_px.sum()}")
-                  
+           
 
 def process_quads(layout, obj_data,  photos, output, W_out, H_out, verbose=False):
     for q in layout.get("quads", []):

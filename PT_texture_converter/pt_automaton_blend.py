@@ -690,9 +690,6 @@ def process_islands(layout, uv_meta, mesh_cache, photos, output,
             conf = np.ones(T_total, dtype=np.float32)
             weights = np.zeros((n_photos, T_total), dtype=np.float32)
             weights[0, :] = 1.0
-            if verbose:
-                print(f"    режим одного фото: все треугольники "
-                      f"на фото 0")
         else:
             # ---------- Seed + propagation ----------
             SEED_COS = 0.5        # было 0.85

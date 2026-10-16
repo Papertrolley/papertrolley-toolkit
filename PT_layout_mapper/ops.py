@@ -850,6 +850,100 @@ def _fit_best_uv_combination(candidates_per_corner, layout_px, verbose=True):
     return best["combo"], best["rmse"], (best["a"], best["theta"],
                                           best["tx"], best["ty"])
 
+def _snapshot_island(isl):
+    corners = []
+    for c in isl.corners:
+        corners.append({
+            "obj_name": c.obj_name,
+            "vertex_index": c.vertex_index,
+            "vertex_uuid": c.vertex_uuid,
+            "uv": tuple(c.uv),
+            "x_world": tuple(c.x_world),
+            "uv_candidates": tuple(c.uv_candidates),
+            "n_uv_candidates": c.n_uv_candidates,
+            "fit_residual": c.fit_residual,
+        })
+    return {
+        "id": isl.id,
+        "part": isl.part,
+        "duplicate_of": isl.duplicate_of,
+        "corners": corners,
+        "corners_layout_px": tuple(isl.corners_layout_px),
+    }
+
+
+def _restore_island(isl, data):
+    isl.id = data["id"]
+    isl.part = data["part"]
+    isl.duplicate_of = data["duplicate_of"]
+    isl.corners.clear()
+    for cd in data["corners"]:
+        c = isl.corners.add()
+        c.obj_name = cd["obj_name"]
+        c.vertex_index = cd["vertex_index"]
+        c.vertex_uuid = cd["vertex_uuid"]
+        c.uv = cd["uv"]
+        c.x_world = cd["x_world"]
+        c.uv_candidates = cd["uv_candidates"]
+        c.n_uv_candidates = cd["n_uv_candidates"]
+        c.fit_residual = cd["fit_residual"]
+    isl.corners_layout_px = data["corners_layout_px"]
+
+
+def _swap_islands(pba, i, j):
+    if i == j:
+        return
+    if not (0 <= i < len(pba.islands) and 0 <= j < len(pba.islands)):
+        return
+    a = _snapshot_island(pba.islands[i])
+    b = _snapshot_island(pba.islands[j])
+    _restore_island(pba.islands[i], b)
+    _restore_island(pba.islands[j], a)
+
+
+def _snapshot_quad(q):
+    corners = []
+    for c in q.corners_3d:
+        corners.append({
+            "obj_name": c.obj_name,
+            "vertex_index": c.vertex_index,
+            "vertex_uuid": c.vertex_uuid,
+            "x_world": tuple(c.x_world),
+        })
+    return {
+        "id": q.id,
+        "part": q.part,
+        "duplicate_of": q.duplicate_of,
+        "corners": corners,
+        "corners_px": tuple(q.corners_px),
+    }
+
+
+def _restore_quad(q, data):
+    q.id = data["id"]
+    q.part = data["part"]
+    q.duplicate_of = data["duplicate_of"]
+    q.corners_3d.clear()
+    for cd in data["corners"]:
+        c = q.corners_3d.add()
+        c.obj_name = cd["obj_name"]
+        c.vertex_index = cd["vertex_index"]
+        c.vertex_uuid = cd["vertex_uuid"]
+        c.x_world = cd["x_world"]
+    q.corners_px = data["corners_px"]
+
+
+def _swap_quads(pba, i, j):
+    if i == j:
+        return
+    if not (0 <= i < len(pba.quads) and 0 <= j < len(pba.quads)):
+        return
+    a = _snapshot_quad(pba.quads[i])
+    b = _snapshot_quad(pba.quads[j])
+    _restore_quad(pba.quads[i], b)
+    _restore_quad(pba.quads[j], a)
+
+
 # --- Операторы ---
 
 class PBA_LM_OT_load_layout(bpy.types.Operator):
@@ -2441,6 +2535,78 @@ class PBA_LM_OT_sort_islands(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class PBA_LM_OT_move_island_up(bpy.types.Operator):
+    bl_idname = "pba_lm.move_island_up"
+    bl_label = "Move Island Up"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        i = self.index
+        if i <= 0 or i >= len(pba.islands):
+            return {'CANCELLED'}
+        _swap_islands(pba, i, i - 1)
+        pba.active_island_index = i - 1
+        bpy.ops.pba_lm.refresh_highlight()
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_move_island_down(bpy.types.Operator):
+    bl_idname = "pba_lm.move_island_down"
+    bl_label = "Move Island Down"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        i = self.index
+        if i < 0 or i >= len(pba.islands) - 1:
+            return {'CANCELLED'}
+        _swap_islands(pba, i, i + 1)
+        pba.active_island_index = i + 1
+        bpy.ops.pba_lm.refresh_highlight()
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_move_quad_up(bpy.types.Operator):
+    bl_idname = "pba_lm.move_quad_up"
+    bl_label = "Move Quad Up"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        i = self.index
+        if i <= 0 or i >= len(pba.quads):
+            return {'CANCELLED'}
+        _swap_quads(pba, i, i - 1)
+        pba.active_quad_index = i - 1
+        bpy.ops.pba_lm.refresh_highlight()
+        return {'FINISHED'}
+
+
+class PBA_LM_OT_move_quad_down(bpy.types.Operator):
+    bl_idname = "pba_lm.move_quad_down"
+    bl_label = "Move Quad Down"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        pba = context.scene.pba_lm
+        i = self.index
+        if i < 0 or i >= len(pba.quads) - 1:
+            return {'CANCELLED'}
+        _swap_quads(pba, i, i + 1)
+        pba.active_quad_index = i + 1
+        bpy.ops.pba_lm.refresh_highlight()
+        return {'FINISHED'}
+
+
 classes = (
     PBA_LM_OT_load_layout,
     PBA_LM_OT_capture_3d,
@@ -2470,5 +2636,9 @@ classes = (
     PBA_LM_OT_flip_island,
     PBA_LM_OT_set_active_island,
     PBA_LM_OT_sort_quads,
-    PBA_LM_OT_sort_islands
+    PBA_LM_OT_sort_islands,
+    PBA_LM_OT_move_island_up,
+    PBA_LM_OT_move_island_down,
+    PBA_LM_OT_move_quad_up,
+    PBA_LM_OT_move_quad_down
 )
