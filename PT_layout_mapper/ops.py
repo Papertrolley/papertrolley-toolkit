@@ -762,7 +762,12 @@ def _similarity_fit(uv_pts, layout_pts, theta_deg):
     return (a, tx, ty, rmse)
 
 def _fit_best_uv_combination(candidates_per_corner, layout_px, verbose=True):
-    """Полный перебор кандидатов и углов 0..360° шагом 2°."""
+    """Перебор UV-кандидатов с мягким штрафом за выпадающие точки.
+
+    Комбинации с «выпадающим» UV не отбрасываются, а получают
+    дополнительный штраф к RMSE. Это позволяет работать с
+    непрямоугольными островами и L-образными формами.
+    """
     import itertools
     import math
 
@@ -771,18 +776,8 @@ def _fit_best_uv_combination(candidates_per_corner, layout_px, verbose=True):
     if any(n == 0 for n in n_lists):
         return None, None, None
 
-    if verbose:
-        print(f"[PBA LM] Layout points: {layout.tolist()}")
-        for i, c in enumerate(candidates_per_corner):
-            cands_str = ", ".join(f"({u:.4f},{v:.4f})" for (u, v) in c)
-            print(f"[PBA LM]   corner {i}: {len(c)} cand: {cands_str}")
-
-    best_rmse = float('inf')
-    best_combo = None
-    best_params = None
-    best_uv_pts = None
-
     thetas = list(range(0, 360, 2))
+    all_results = []
 
     for combo in itertools.product(*[range(n) for n in n_lists]):
         uv_pts = []
@@ -791,36 +786,69 @@ def _fit_best_uv_combination(candidates_per_corner, layout_px, verbose=True):
             uv_pts.append((u, v))
         uv_pts = np.asarray(uv_pts, dtype=np.float64)
 
+        # Span выбранных UV
+        span = 0.0
+        for i in range(4):
+            for j in range(i + 1, 4):
+                d = float(np.linalg.norm(uv_pts[i] - uv_pts[j]))
+                if d > span:
+                    span = d
+        if span < 1e-6:
+            continue
+
+        # Оценка «выпадения»: сколько точек далеко от центроида
+        outlier_score = 0.0
+        for i in range(4):
+            others = np.delete(uv_pts, i, axis=0)
+            centroid = others.mean(axis=0)
+            d_i = float(np.linalg.norm(uv_pts[i] - centroid))
+            if d_i > 0.75 * span:
+                # Штраф пропорционален превышению порога
+                outlier_score += (d_i - 0.75 * span) * 1000.0
+
         for theta in thetas:
             res = _similarity_fit(uv_pts, layout, theta)
             if res is None:
                 continue
             a, tx, ty, rmse = res
-            if rmse < best_rmse:
-                best_rmse = rmse
-                best_combo = combo
-                best_params = (a, theta, tx, ty)
-                best_uv_pts = uv_pts
+            all_results.append({
+                "combo": combo,
+                "theta": theta,
+                "a": a,
+                "tx": tx, "ty": ty,
+                "rmse": rmse,
+                "outlier_score": outlier_score,
+                "total": rmse + outlier_score,
+                "span": span,
+                "uv_pts": uv_pts,
+            })
 
-    if best_combo is None:
+    if not all_results:
         return None, None, None
 
-    if verbose:
-        print(f"[PBA LM] Best: rmse={best_rmse:.4f}, "
-              f"scale={best_params[0]:.3f}, θ={best_params[1]}°, "
-              f"combo={best_combo}")
-        a, theta, tx, ty = best_params
-        th = math.radians(theta)
-        c, s = math.cos(th), math.sin(th)
-        R = np.array([[c, -s], [s, c]])
-        for i in range(4):
-            rp = R @ best_uv_pts[i]
-            px = a * rp[0] + tx
-            py = a * rp[1] + ty
-            print(f"[PBA LM]   corner {i}: pred=({px:.1f},{py:.1f}) "
-                  f"act=({layout[i,0]:.1f},{layout[i,1]:.1f})")
+    all_results.sort(key=lambda r: r["total"])
+    best = all_results[0]
 
-    return best_combo, best_rmse, best_params
+    if verbose:
+        print(f"[PBA LM] UV fit: rmse={best['rmse']:.4f}, "
+              f"outlier_penalty={best['outlier_score']:.2f}, "
+              f"итого={best['total']:.4f}, "
+              f"scale={best['a']:.3f}, θ={best['theta']}°, "
+              f"combo={best['combo']}, span={best['span']:.4f}")
+        if best["outlier_score"] > 0:
+            print(f"[PBA LM]   (штраф за выпадающие UV применён)")
+        # Топ-3 для диагностики
+        if len(all_results) > 1:
+            print(f"[PBA LM]   top-3:")
+            for r in all_results[:3]:
+                print(f"     rmse={r['rmse']:.4f} "
+                      f"penalty={r['outlier_score']:.2f} "
+                      f"итого={r['total']:.4f} "
+                      f"θ={r['theta']}° combo={r['combo']}")
+
+    best_uv = best["uv_pts"]
+    return best["combo"], best["rmse"], (best["a"], best["theta"],
+                                          best["tx"], best["ty"])
 
 # --- Операторы ---
 
@@ -1828,6 +1856,45 @@ class PBA_LM_OT_start_island(bpy.types.Operator):
         if not island_faces:
             self.report({'ERROR'}, "Остров не найден")
             return {'CANCELLED'}
+
+        # Вычисляем UV bbox всего острова (через bmesh, работает
+        # и в Edit Mode, и в Object Mode)
+        all_uv = []
+        if (bpy.context.mode == 'EDIT_MESH'
+                and bpy.context.active_object == obj):
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.faces.ensure_lookup_table()
+            uv_layer = bm.loops.layers.uv.get(uv_name)
+            if uv_layer is not None:
+                for fi in island_faces:
+                    if fi < 0 or fi >= len(bm.faces):
+                        continue
+                    for loop in bm.faces[fi].loops:
+                        uv = loop[uv_layer].uv
+                        all_uv.append((uv.x, uv.y))
+        else:
+            uv_layer = obj.data.uv_layers.get(uv_name)
+            if uv_layer is not None and len(uv_layer.data) > 0:
+                for fi in island_faces:
+                    poly = obj.data.polygons[fi]
+                    for li in poly.loop_indices:
+                        uv = uv_layer.data[li].uv
+                        all_uv.append((uv.x, uv.y))
+
+        if all_uv:
+            u_min = min(p[0] for p in all_uv)
+            u_max = max(p[0] for p in all_uv)
+            v_min = min(p[1] for p in all_uv)
+            v_max = max(p[1] for p in all_uv)
+            u_span = u_max - u_min
+            v_span = v_max - v_min
+            print(f"[PBA LM] Остров: {len(island_faces)} граней, "
+                  f"UV bbox ({u_min:.3f},{v_min:.3f})-({u_max:.3f},{v_max:.3f}), "
+                  f"span U={u_span:.3f}, V={v_span:.3f}")
+            if u_span > 0.5 or v_span > 0.5:
+                print(f"[PBA LM] ВНИМАНИЕ: остров имеет большой UV bbox. "
+                      f"Возможно, BFS склеил несколько островов. "
+                      f"Проверьте визуально.")
 
         pba.pending_island_obj = obj.name
         pba.pending_island_uv_name = uv_name
