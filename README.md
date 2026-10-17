@@ -117,16 +117,14 @@
 
 - **[Подготовка модели](docs/00_model_prep.md)** — первое,
   что нужно сделать, до любых других шагов.
-- **[PBA UV Exporter](docs/01_uv_exporter.md)** — UUID и
+- **[PT Scaled UV](docs/01_uv_exporter.md)** — UUID и
   экспорт развёртки.
-- **[PBA Vertex Mapper](docs/02_vertex_mapper.md)** —
-  калибровка камеры по фотографии.
-- **[PBA Layout Mapper](docs/03_layout_mapper.md)** —
-  разметка выкройки.
+- **[PT Layout Mapper](docs/02_layout_mapper.md)** —
+  разметка листов выкройки.
+- **[PT Photo Mapper](docs/03_photo_mapper.md)** —
+  восстановление положения камеры по фотографии.
 - **[transfer_blender.py](docs/04_transfer.md)** —
   перенос текстур.
-- **[Типичные ошибки](docs/05_troubleshooting.md)** —
-  что делать, если что-то пошло не так.
 
 ## Структура репозитория
 
@@ -144,10 +142,9 @@ papertrolley-toolkit/
 ├── docs/                 ← документация
 │   ├── 00_model_prep.md
 │   ├── 01_uv_exporter.md
-│   ├── 02_vertex_mapper.md
-│   ├── 03_layout_mapper.md
+│   ├── 02_layout_mapper.md
+│   ├── 03_photo_mapper.md
 │   ├── 04_transfer.md
-│   └── 05_troubleshooting.md
 └── examples/             ← примеры (опционально)
     └── liaz-5292/
         ├── LiAZ-52926503_1-2-0_Songz.blend       ← 3D-модель
