@@ -1,3 +1,17 @@
+# Copyright (C) 2026 Mungojerrie
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #!/usr/bin/env python3
 """
 PBA Texture Transfer (Blender edition).
@@ -6,13 +20,7 @@ PBA Texture Transfer (Blender edition).
 Не требует OBJ или иных промежуточных форматов.
 
 Запуск:
-    blender --background model.blend --python transfer_blender.py -- \\
-        --layout <layout.quads.json> \\
-        --uv-json <layout_uv.uv.json> \\
-        --photo <photo.jpg> --photo-meta <photo.vertices.json> \\
-        [--photo ... --photo-meta ...] \\
-        --out <result.png> \\
-        [--bg layout|transparent] [--verbose]
+    см. актуальный вывод --help
 """
 
 import argparse
@@ -397,10 +405,8 @@ def _expand_island_region(output, y0, y1, x0, x1,
     out_region[write_mask, 0:3] = buf_color[write_mask]
     out_region[write_mask, 3] = buf_alpha[write_mask]
 
-def process_islands(layout, uv_meta, mesh_cache, photos, output,
+def process_islands(layout, mesh_cache, photos, output,
                      W_out, H_out, verbose=False, expand_n=0, expand_alpha=255):
-    objects_meta = {o["name"]: o for o in uv_meta["objects"]}
-    
     # Нормали всех треугольников меша (для выбора ракурса)
     tri_normal_cache = {}
 
@@ -1177,7 +1183,6 @@ def main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--layout", required=True)
-    ap.add_argument("--uv-json", required=True)
     ap.add_argument("--photo", action="append", required=True)
     ap.add_argument("--photo-meta", action="append", required=True)
     ap.add_argument("--out", required=True)
@@ -1196,7 +1201,7 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    for path in [args.layout, args.uv_json] + args.photo + args.photo_meta:
+    for path in [args.layout] + args.photo + args.photo_meta:
         if not os.path.exists(path):
             print(f"Файл не найден: {path}", file=sys.stderr)
             sys.exit(1)
@@ -1205,7 +1210,6 @@ def main():
     bpy.context.view_layer.update()
 
     layout = load_json(args.layout)
-    uv_meta = load_json(args.uv_json)
 
     # Собираем mesh_data только для объектов, упомянутых в layout
     needed_objs = set()
@@ -1285,7 +1289,7 @@ def main():
           f"квады: {len(layout.get('quads', []))}")
 
     print("Обработка островов...")
-    process_islands(layout, uv_meta, mesh_cache, photos, output,
+    process_islands(layout, mesh_cache, photos, output,
                      W_out, H_out, verbose=args.verbose, expand_n=args.expand, expand_alpha=args.expand_alpha)
 
     print("Обработка квадов...")
