@@ -489,23 +489,63 @@ class PBA_VM_OT_load_photo(bpy.types.Operator):
             return {'CANCELLED'}
 
         W_actual, H_actual = img.size
+        pba = scene.pba_vm
 
-        # Определяем нативное разрешение
-        if scene.pba_vm.use_native_resolution:
+        # --- 1. Нативное разрешение ---
+        if (pba.use_manual_camera
+                and pba.manual_native_width > 0
+                and pba.manual_native_height > 0):
+            nw = pba.manual_native_width
+            nh = pba.manual_native_height
+            src = "manual"
+        elif pba.use_native_resolution:
             nw, nh, src = detect_native_resolution(
                 path, W_actual, H_actual)
         else:
             nw, nh, src = W_actual, H_actual, "same"
 
-        scene.pba_vm.native_width_px = nw
-        scene.pba_vm.native_height_px = nh
-        scene.pba_vm.native_source = src
+        pba.native_width_px = nw
+        pba.native_height_px = nh
+        pba.native_source = src
 
+        # --- 2. Фокусное и сенсор ---
+        focal_exif, sensor_exif = camera_params(path)
+
+        if pba.use_manual_camera and pba.manual_focal_length > 0:
+            focal = pba.manual_focal_length
+            focal_src = "manual"
+        elif focal_exif:
+            focal = focal_exif
+            focal_src = "exif"
+        else:
+            focal = DEFAULT_LENS_MM
+            focal_src = "default"
+
+        if pba.use_manual_camera and pba.manual_sensor_width > 0:
+            sensor = pba.manual_sensor_width
+            sensor_src = "manual"
+        elif sensor_exif:
+            sensor = sensor_exif
+            sensor_src = "model"
+        else:
+            sensor = DEFAULT_SENSOR_MM
+            sensor_src = "default"
+
+        # --- 3. Лог и предупреждения ---
         if src != "same":
             print(f"[PBA VM] Кроп: реальное {W_actual}×{H_actual}, "
                   f"нативное {nw}×{nh} (источник: {src})")
         else:
             print(f"[PBA VM] Размер {W_actual}×{H_actual} — нативный")
+
+        print(f"[PBA VM] Камера: focal={focal:.1f}мм ({focal_src}), "
+              f"sensor={sensor:.2f}мм ({sensor_src})")
+
+        if focal_src == "default" or sensor_src == "default":
+            print(f"[PBA VM] ВНИМАНИЕ: параметры камеры не определены "
+                  f"из EXIF. Если фото кропнутое — включите "
+                  f"'Use Manual Camera' и укажите правильные значения. "
+                  f"Иначе f_px будет неверным и Solve развалится.")
 
         # Синхронизируем рендер с фото — иначе world_to_camera_view
         # работает в другом аспекте, и координаты уезжают.

@@ -83,6 +83,8 @@ def camera_params(path):
 
     sensor = None
     known = sensor_from_model(exif.get("Model"))
+    if known is None:
+        known = sensor_from_model(exif.get("Make") + ' ' + exif.get("Model"))
     if known is not None:
         sensor = known[0]
     elif focal and focal35 and focal35 > 0:
@@ -145,6 +147,7 @@ def detect_native_resolution(path, W_actual, H_actual, verbose=False):
     source ∈ {'model', 'exif', 'same'}.
     """
     exif = read_exif(path)
+    manufacturer = exif.get("Make", "")
     model = exif.get("Model", "")
 
     from_model = native_resolution_from_model(model)
@@ -152,7 +155,12 @@ def detect_native_resolution(path, W_actual, H_actual, verbose=False):
         w, h = from_model
         if W_actual <= w and H_actual <= h:
             return (w, h, "model")
-
+    else:
+        from_model = native_resolution_from_model(manufacturer + ' ' + model)
+        if from_model is not None:
+            w, h = from_model
+            if W_actual <= w and H_actual <= h:
+                return (w, h, "model")
     from_exif = native_resolution_from_exif(exif)
     if from_exif is not None:
         w, h = from_exif

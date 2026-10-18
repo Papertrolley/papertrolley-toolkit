@@ -36,6 +36,19 @@ class PBA_VM_PT_main(bpy.types.Panel):
         box.label(text="Camera Start", icon='CAMERA_DATA')
         box.prop(pba, "camera_position", text="")
         box.prop(pba, "crop_factor")
+        box = layout.box()
+        box.label(text="Manual Camera Override", icon='PREFERENCES')
+        box.prop(pba, "use_manual_camera")
+        sub = box.column(align=True)
+        sub.enabled = pba.use_manual_camera
+        row = sub.row(align=True)
+        row.prop(pba, "manual_native_width", text="Native W")
+        row.prop(pba, "manual_native_height", text="×")
+        sub.prop(pba, "manual_sensor_width")
+        sub.prop(pba, "manual_focal_length")
+        if pba.use_manual_camera:
+            hint = sub.row()
+            hint.label(text="0 = авто (из EXIF)", icon='INFO')
 
         col = layout.column(align=True)
         col.operator("pba_vm.load_photo", icon='CAMERA_DATA')

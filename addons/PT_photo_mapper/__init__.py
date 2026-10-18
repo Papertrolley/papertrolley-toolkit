@@ -91,6 +91,24 @@ class PBA_VM_Props(bpy.types.PropertyGroup):
     native_source: bpy.props.StringProperty(default="")
     physical_lens_mm: bpy.props.FloatProperty(
         name="Physical lens (mm)", default=50.0)    
+    use_manual_camera: bpy.props.BoolProperty(
+        name="Use Manual Camera",
+        description="Использовать ручные параметры вместо EXIF. "
+                    "Нужно для кропнутых фото без EXIF",
+        default=False)
+    manual_native_width: bpy.props.IntProperty(
+        name="Native Width, px", default=0, min=0,
+        description="Полное нативное разрешение по ширине (0 = авто)")
+    manual_native_height: bpy.props.IntProperty(
+        name="Native Height, px", default=0, min=0,
+        description="Полное нативное разрешение по высоте (0 = авто)")
+    manual_sensor_width: bpy.props.FloatProperty(
+        name="Sensor Width, mm", default=0.0, min=0.0,
+        description="Физическая ширина сенсора в мм (0 = авто). "
+                    "Nikon Z50: 23.5. Полный кадр: 36.0")
+    manual_focal_length: bpy.props.FloatProperty(
+        name="Focal Length, mm", default=0.0, min=0.0,
+        description="Физическое фокусное расстояние в мм (0 = авто)")
 
 classes = (PBA_VM_Correspondence, PBA_VM_Props) + ops.classes + panel.classes
 
