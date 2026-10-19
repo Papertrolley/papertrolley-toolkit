@@ -82,9 +82,9 @@ def camera_params(path):
     focal35 = _to_float(exif.get("FocalLengthIn35mmFilm"))
 
     sensor = None
-    known = sensor_from_model(exif.get("Model"))
+    known = sensor_from_model(exif.get("Model", ""))
     if known is None:
-        known = sensor_from_model(exif.get("Make") + ' ' + exif.get("Model"))
+        known = sensor_from_model(exif.get("Make", "") + ' ' + exif.get("Model", ""))
     if known is not None:
         sensor = known[0]
     elif focal and focal35 and focal35 > 0:

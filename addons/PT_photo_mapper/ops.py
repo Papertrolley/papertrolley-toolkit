@@ -119,7 +119,7 @@ def find_vertex_by_uuid(obj, uuid_val, hint_world=None):
 DEFAULT_LENS_MM = 50.0
 DEFAULT_SENSOR_MM = 36.0
 
-CAMERA_DISTANCE_M = 10.0
+CAMERA_DISTANCE_M = 20.0
 CAMERA_NAME = "PBA_VM_Camera"
 
 # Относительный допуск при сравнении расстояний. 0.1% от дистанции
@@ -127,9 +127,9 @@ CAMERA_NAME = "PBA_VM_Camera"
 VISIBILITY_EPS_REL = 1e-3
 
 _POSITIONS = {
-    'FRONT': (( CAMERA_DISTANCE_M, 0.0, 0.0),
+    'FRONT': (( CAMERA_DISTANCE_M * 2, 0.0, 0.0),
               (math.pi / 2, 0.0,  math.pi / 2)),
-    'BACK':  ((-CAMERA_DISTANCE_M, 0.0, 0.0),
+    'BACK':  ((-CAMERA_DISTANCE_M * 2, 0.0, 0.0),
               (math.pi / 2, 0.0, -math.pi / 2)),
     'LEFT': ((0.0,  CAMERA_DISTANCE_M, 0.0),
               (math.pi / 2, 0.0,  math.pi)),
@@ -212,6 +212,8 @@ def _build_json_data(scene, path, W, H, cam_obj):
             "native_width_px": int(pba.native_width_px or W),
             "native_height_px": int(pba.native_height_px or H),
             "native_source": pba.native_source or "same",
+            "crop_offset_x": int(pba.crop_offset_x),
+            "crop_offset_y": int(pba.crop_offset_y),
         },
         "camera": {
             "name": cam_obj.name,
@@ -266,6 +268,8 @@ def _apply_json_data(scene, data, path, W, H, cam_obj):
     nh = int(photo_info.get("native_height_px", H))
     max_native = max(nw, nh)
     max_loaded = max(W, H)
+    pba.crop_offset_x = int(photo_info.get("crop_offset_x", 0))
+    pba.crop_offset_y = int(photo_info.get("crop_offset_y", 0))
 
     if render_lens > 0:
         cam_obj.data.lens = render_lens
@@ -587,6 +591,19 @@ class PBA_VM_OT_load_photo(bpy.types.Operator):
 
         cam_obj.location = location
         cam_obj.rotation_euler = rotation
+        # ВАЖНО: shift_x и shift_y имеют разные знаки относительно
+        # crop_offset_*, потому что:
+        #   - crop_offset_* в пиксельной системе (Y растёт вниз);
+        #   - shift_y в системе co.y (Y растёт вверх);
+        #   - shift_x в экранной системе (X совпадает с пиксельной).
+        # Двойная инверсия по Y даёт один знак, одинарная по X — другой.
+        if pba.crop_offset_x != 0 or pba.crop_offset_y != 0:
+            cam_obj.data.sensor_fit = 'HORIZONTAL'
+            cam_obj.data.shift_x = -pba.crop_offset_x / W_actual
+            cam_obj.data.shift_y = +pba.crop_offset_y / W_actual
+        else:
+            cam_obj.data.shift_x = 0.0
+            cam_obj.data.shift_y = 0.0
 
         try:
             bg = cam_data.background_images.new()
@@ -930,14 +947,13 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
             self.report({'WARNING'},
                         f"Активных пар {len(corrs)}, нужно ≥6")
             return {'CANCELLED'}
-
+            
+        pba = scene.pba_vm
         W, H = _get_photo_size(scene)
         if W == 0 or H == 0:
             self.report({'ERROR'}, "Размер фото неизвестен")
             return {'CANCELLED'}
 
-
-        pba = scene.pba_vm
         lens = cam.data.lens
         sensor = cam.data.sensor_width
 
@@ -960,7 +976,12 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
             print(f"[PBA VM] синхронизировано {n} 3D-координат")
 
         world_pts = [np.array(c.x3d) for c in corrs]
-        pixel_pts = [np.array(c.x2d) for c in corrs]
+        off_x = pba.crop_offset_x
+        off_y = pba.crop_offset_y
+        if off_x != 0 or off_y != 0:
+            print(f"[PBA solve] Применяю crop offset: "
+                  f"({off_x}, {off_y}) px")
+        pixel_pts = [np.array(c.x2d) - np.array([off_x, off_y]) for c in corrs]
 
         from mathutils import Matrix
         from .solver import pose_refine_multistart
@@ -994,24 +1015,44 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
               f"rmse={rmse:.3f}, k1={k1:+.4f}, k2={k2:+.4f}")
 
         cam.matrix_world = Matrix(M_best.tolist())
+        # Синхронизировать shift камеры с текущим offset
+        # См. комментарий в PBA_VM_OT_load_photo про разные знаки X/Y.
+        if off_x != 0 or off_y != 0:
+            cam.data.sensor_fit = 'HORIZONTAL'
+            cam.data.shift_x = -off_x / W
+            cam.data.shift_y = +off_y / W
+        else:
+            cam.data.shift_x = 0.0
+            cam.data.shift_y = 0.0
+        
         pba.last_k1 = k1
         pba.last_k2 = k2
         pba.last_f_px = base_f_px
 
-        cx, cy = W / 2.0, H / 2.0
+        # Оценка ошибки через P-матрицу (согласовано с LM)
+        # LM минимизирует |P(X) - (x2d - off)|, поэтому используем
+        # ту же формулу.
+        D = np.diag([1.0, -1.0, -1.0, 1.0])
+        M_cv = D @ np.linalg.inv(np.array(M_best))
+        K = np.array([
+            [base_f_px, 0.0, W / 2.0],
+            [0.0, base_f_px, H / 2.0],
+            [0.0, 0.0, 1.0],
+        ])
+        P = K @ M_cv[:3, :]
+
         errors = []
         for c in corrs:
-            co = world_to_camera_view(
-                scene, cam, Vector((c.x3d[0], c.x3d[1], c.x3d[2])))
-            u_px = co.x * W
-            v_px = (1.0 - co.y) * H
-            xn = (u_px - cx) / base_f_px
-            yn = (v_px - cy) / base_f_px
-            r2 = xn * xn + yn * yn
-            fac = 1.0 + k1 * r2 + k2 * r2 * r2
-            u_d = base_f_px * xn * fac + cx
-            v_d = base_f_px * yn * fac + cy
-            err = ((u_d - c.x2d[0]) ** 2 + (v_d - c.x2d[1]) ** 2) ** 0.5
+            X = np.array([c.x3d[0], c.x3d[1], c.x3d[2], 1.0])
+            proj = P @ X
+            if proj[2] <= 1e-9:
+                err = 1e6
+            else:
+                u = proj[0] / proj[2]
+                v = proj[1] / proj[2]
+                u_adj = c.x2d[0] - off_x
+                v_adj = c.x2d[1] - off_y
+                err = ((u - u_adj) ** 2 + (v - v_adj) ** 2) ** 0.5
             c.last_error = err
             errors.append(err)
 
@@ -1076,21 +1117,33 @@ class PBA_VM_OT_diagnose_pairs(bpy.types.Operator):
         f_px = pba.last_f_px if pba.last_f_px > 0 else 1.0
         k1 = pba.last_k1
         k2 = pba.last_k2
-        cx, cy = W / 2.0, H / 2.0
+        off_x = pba.crop_offset_x
+        off_y = pba.crop_offset_y
+
+        # Оценка ошибки через P-матрицу (согласовано с LM)
+        # LM минимизирует |P(X) - (x2d - off)|, поэтому используем
+        # ту же формулу.
+        D = np.diag([1.0, -1.0, -1.0, 1.0])
+        M_cv = D @ np.linalg.inv(np.array(np.array(cam.matrix_world)))
+        K = np.array([
+            [f_px, 0.0, W / 2.0],
+            [0.0, f_px, H / 2.0],
+            [0.0, 0.0, 1.0],
+        ])
+        P = K @ M_cv[:3, :]
 
         errors = []
         for c in corrs:
-            co = world_to_camera_view(
-                scene, cam, Vector((c.x3d[0], c.x3d[1], c.x3d[2])))
-            u_px = co.x * W
-            v_px = (1.0 - co.y) * H
-            xn = (u_px - cx) / f_px
-            yn = (v_px - cy) / f_px
-            r2 = xn * xn + yn * yn
-            fac = 1.0 + k1 * r2 + k2 * r2 * r2
-            u_d = f_px * xn * fac + cx
-            v_d = f_px * yn * fac + cy
-            err = ((u_d - c.x2d[0]) ** 2 + (v_d - c.x2d[1]) ** 2) ** 0.5
+            X = np.array([c.x3d[0], c.x3d[1], c.x3d[2], 1.0])
+            proj = P @ X
+            if proj[2] <= 1e-9:
+                err = 1e6
+            else:
+                u = proj[0] / proj[2]
+                v = proj[1] / proj[2]
+                u_adj = c.x2d[0] - off_x
+                v_adj = c.x2d[1] - off_y
+                err = ((u - u_adj) ** 2 + (v - v_adj) ** 2) ** 0.5
             c.last_error = err
             errors.append(err)
 

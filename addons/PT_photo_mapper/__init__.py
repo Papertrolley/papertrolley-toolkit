@@ -109,6 +109,15 @@ class PBA_VM_Props(bpy.types.PropertyGroup):
     manual_focal_length: bpy.props.FloatProperty(
         name="Focal Length, mm", default=0.0, min=0.0,
         description="Физическое фокусное расстояние в мм (0 = авто)")
+    crop_offset_x: bpy.props.IntProperty(
+        name="Crop Offset X, px", default=0,
+        description="Сдвиг главной точки по X. Для нецентрального "
+                    "кропа. Положительный = главная точка правее центра")
+    crop_offset_y: bpy.props.IntProperty(
+        name="Crop Offset Y, px", default=0,
+        description="Сдвиг главной точки по Y. Для нецентрального "
+                    "кропа. Положительный = главная точка ниже центра")
+
 
 classes = (PBA_VM_Correspondence, PBA_VM_Props) + ops.classes + panel.classes
 

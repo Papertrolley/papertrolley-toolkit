@@ -49,6 +49,14 @@ class PBA_VM_PT_main(bpy.types.Panel):
         if pba.use_manual_camera:
             hint = sub.row()
             hint.label(text="0 = авто (из EXIF)", icon='INFO')
+        box = layout.box()
+        box.label(text="Crop Offset", icon='FULLSCREEN_EXIT')
+        row = box.row(align=True)
+        row.prop(pba, "crop_offset_x", text="X")
+        row.prop(pba, "crop_offset_y", text="Y")
+        hint = box.row()
+        hint.label(text="Подбор: начни с 0, смотри на визуальный "
+                        "сдвиг модели", icon='INFO')
 
         col = layout.column(align=True)
         col.operator("pba_vm.load_photo", icon='CAMERA_DATA')

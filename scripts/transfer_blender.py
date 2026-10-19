@@ -142,9 +142,13 @@ def make_camera_matrix(photo_meta):
         nh = float(photo_meta["photo"].get("native_height_px", H))
         f_px = lens / sensor * max(nw, nh)
 
+    # Главная точка с учётом кропа
+    off_x = float(photo_meta["photo"].get("crop_offset_x", 0))
+    off_y = float(photo_meta["photo"].get("crop_offset_y", 0))
+
     K = np.array([
-        [f_px, 0.0, W / 2.0],
-        [0.0, f_px, H / 2.0],
+        [f_px, 0.0, W / 2.0 + off_x],
+        [0.0, f_px, H / 2.0 + off_y],
         [0.0, 0.0, 1.0],
     ])
     return K @ m_cv[:3, :], W, H
@@ -1230,7 +1234,7 @@ def main():
                       f"{len(md['triangles'])} треугольников")
 
     # Резолюция выходного PNG
-    W_out, H_out = 4960, 7016
+    W_out, H_out = layout.get("size", [])
     if args.bg == "layout":
         layout_png = os.path.splitext(args.layout)[0] + ".png"
         if os.path.exists(layout_png):
