@@ -126,6 +126,7 @@ class PBA_LM_Props(bpy.types.PropertyGroup):
     pending_island_corners: bpy.props.CollectionProperty(
         type=PBA_LM_IslandCorner)
     active_island_index: bpy.props.IntProperty(default=-1)
+    pending_island_seed_face: bpy.props.IntProperty(default=-1)
     
 
 classes = (

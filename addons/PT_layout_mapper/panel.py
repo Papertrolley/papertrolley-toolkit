@@ -46,6 +46,8 @@ class PBA_LM_PT_main(bpy.types.Panel):
         if pba.mode == 'ISLAND':
             box = layout.box()
             box.label(text="Current Island", icon='MESH_GRID')
+            box.label(text="Кликните на грань острова, затем 4 вершины",
+          icon='INFO')
             n_v = len(pba.pending_island_corners)
             n_px = pba.pending_px_count
             box.label(text=f"Object: {pba.pending_island_obj or '—'}")

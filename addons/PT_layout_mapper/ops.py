@@ -738,132 +738,6 @@ def _find_nearest_vertex(context, event, obj, allowed_indices,
     return best_idx
 
 
-def _similarity_fit(uv_pts, layout_pts, theta_deg):
-    """Оптимальное подобие layout ≈ a·R(θ)·uv + t.
-    Возвращает (a, tx, ty, rmse) или None."""
-    import math
-    th = math.radians(theta_deg)
-    c, s = math.cos(th), math.sin(th)
-    R = np.array([[c, -s], [s, c]])
-
-    uv = np.asarray(uv_pts, dtype=np.float64)
-    lp = np.asarray(layout_pts, dtype=np.float64)
-
-    rot_pts = uv @ R.T  # (4, 2)
-
-    A = np.zeros((8, 3))
-    b = lp.reshape(-1)
-    for i in range(4):
-        A[2 * i, 0] = rot_pts[i, 0]
-        A[2 * i, 1] = 1.0
-        A[2 * i + 1, 0] = rot_pts[i, 1]
-        A[2 * i + 1, 2] = 1.0
-
-    try:
-        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
-    except np.linalg.LinAlgError:
-        return None
-    a, tx, ty = sol
-    if abs(a) < 1e-9:
-        return None
-
-    pred = np.zeros((4, 2))
-    for i in range(4):
-        pred[i, 0] = a * rot_pts[i, 0] + tx
-        pred[i, 1] = a * rot_pts[i, 1] + ty
-    res = lp - pred
-    rmse = float(np.sqrt((res ** 2).sum() / 4))
-    return (a, tx, ty, rmse)
-
-def _fit_best_uv_combination(candidates_per_corner, layout_px, verbose=True):
-    """Перебор UV-кандидатов с мягким штрафом за выпадающие точки.
-
-    Комбинации с «выпадающим» UV не отбрасываются, а получают
-    дополнительный штраф к RMSE. Это позволяет работать с
-    непрямоугольными островами и L-образными формами.
-    """
-    import itertools
-    import math
-
-    layout = np.asarray(layout_px, dtype=np.float64)
-    n_lists = [len(c) for c in candidates_per_corner]
-    if any(n == 0 for n in n_lists):
-        return None, None, None
-
-    thetas = list(range(0, 360, 2))
-    all_results = []
-
-    for combo in itertools.product(*[range(n) for n in n_lists]):
-        uv_pts = []
-        for i, k in enumerate(combo):
-            u, v = candidates_per_corner[i][k]
-            uv_pts.append((u, v))
-        uv_pts = np.asarray(uv_pts, dtype=np.float64)
-
-        # Span выбранных UV
-        span = 0.0
-        for i in range(4):
-            for j in range(i + 1, 4):
-                d = float(np.linalg.norm(uv_pts[i] - uv_pts[j]))
-                if d > span:
-                    span = d
-        if span < 1e-6:
-            continue
-
-        # Оценка «выпадения»: сколько точек далеко от центроида
-        outlier_score = 0.0
-        for i in range(4):
-            others = np.delete(uv_pts, i, axis=0)
-            centroid = others.mean(axis=0)
-            d_i = float(np.linalg.norm(uv_pts[i] - centroid))
-            if d_i > 0.75 * span:
-                # Штраф пропорционален превышению порога
-                outlier_score += (d_i - 0.75 * span) * 1000.0
-
-        for theta in thetas:
-            res = _similarity_fit(uv_pts, layout, theta)
-            if res is None:
-                continue
-            a, tx, ty, rmse = res
-            all_results.append({
-                "combo": combo,
-                "theta": theta,
-                "a": a,
-                "tx": tx, "ty": ty,
-                "rmse": rmse,
-                "outlier_score": outlier_score,
-                "total": rmse + outlier_score,
-                "span": span,
-                "uv_pts": uv_pts,
-            })
-
-    if not all_results:
-        return None, None, None
-
-    all_results.sort(key=lambda r: r["total"])
-    best = all_results[0]
-
-    if verbose:
-        print(f"[PBA LM] UV fit: rmse={best['rmse']:.4f}, "
-              f"outlier_penalty={best['outlier_score']:.2f}, "
-              f"итого={best['total']:.4f}, "
-              f"scale={best['a']:.3f}, θ={best['theta']}°, "
-              f"combo={best['combo']}, span={best['span']:.4f}")
-        if best["outlier_score"] > 0:
-            print(f"[PBA LM]   (штраф за выпадающие UV применён)")
-        # Топ-3 для диагностики
-        if len(all_results) > 1:
-            print(f"[PBA LM]   top-3:")
-            for r in all_results[:3]:
-                print(f"     rmse={r['rmse']:.4f} "
-                      f"penalty={r['outlier_score']:.2f} "
-                      f"итого={r['total']:.4f} "
-                      f"θ={r['theta']}° combo={r['combo']}")
-
-    best_uv = best["uv_pts"]
-    return best["combo"], best["rmse"], (best["a"], best["theta"],
-                                          best["tx"], best["ty"])
-
 def _snapshot_island(isl):
     corners = []
     for c in isl.corners:
@@ -1955,12 +1829,18 @@ class PBA_LM_OT_start_island(bpy.types.Operator):
             self.report({'ERROR'}, "У объекта нет UV-слоя")
             return {'CANCELLED'}
 
-        seeds = _get_selected_face_indices(obj)
-        if not seeds:
-            self.report({'ERROR'}, "Выделите грани острова (L под курсором)")
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+
+        if bm.faces.active is None:
+            self.report({'ERROR'},
+                        "Кликните на грань острова, чтобы выбрать "
+                        "активную (последняя выделенная грань в Blender).")
             return {'CANCELLED'}
 
-        island_faces = _find_island_faces(obj, uv_name, seeds)
+        seed = [bm.faces.active.index]
+        island_faces = _find_island_faces(obj, uv_name, seed)
+        
         if not island_faces:
             self.report({'ERROR'}, "Остров не найден")
             return {'CANCELLED'}
@@ -2006,6 +1886,7 @@ class PBA_LM_OT_start_island(bpy.types.Operator):
 
         pba.pending_island_obj = obj.name
         pba.pending_island_uv_name = uv_name
+        pba.pending_island_seed_face = seed[0]
         pba.pending_island_corners.clear()
         pba.pending_corners_px = (0.0,) * 8
         pba.pending_px_count = 0
@@ -2040,14 +1921,14 @@ class PBA_LM_OT_pick_island_vertices(bpy.types.Operator):
             self.report({'ERROR'}, "Запустите из 3D Viewport")
             return {'CANCELLED'}
 
-        seeds = _get_selected_face_indices(obj)
-        if not seeds:
-            self.report({'ERROR'}, "Выделение острова потеряно, "
-                        "перезапустите Start Island")
+        if pba.pending_island_seed_face < 0:
+            self.report({'ERROR'}, "Seed face не задан. "
+                        "Начните с Start Island.")
             return {'CANCELLED'}
 
         self._island_faces = _find_island_faces(
-            obj, pba.pending_island_uv_name, seeds)
+            obj, pba.pending_island_uv_name,
+            [pba.pending_island_seed_face])
         verts = set()
         for fi in self._island_faces:
             poly = obj.data.polygons[fi]
@@ -2079,19 +1960,28 @@ class PBA_LM_OT_pick_island_vertices(bpy.types.Operator):
             uvs = _vertex_uv_candidates(
                 obj, pba.pending_island_uv_name, vi, self._island_faces)
             if not uvs:
+                _set_status(
+                    scene,
+                    f"Вершина v{vi} не принадлежит острову")
                 return {'RUNNING_MODAL'}
+
+            if len(uvs) > 1:
+                _set_status(
+                    scene,
+                    f"ВНИМАНИЕ: v{vi} имеет {len(uvs)} UV внутри "
+                    f"острова. Использован первый.")
+                print(f"[PBA LM] v{vi}: {len(uvs)} UV внутри острова — "
+                      f"проверьте топологию")
 
             p_world = obj.matrix_world @ obj.data.vertices[vi].co
             c = pba.pending_island_corners.add()
             c.obj_name = obj.name
             c.vertex_index = vi
             c.vertex_uuid = get_vertex_uuid(obj, vi)
-            n = min(len(uvs), 8)
-            c.n_uv_candidates = n
+            c.n_uv_candidates = 1
             arr = [0.0] * 16
-            for k in range(n):
-                arr[k * 2] = uvs[k][0]
-                arr[k * 2 + 1] = uvs[k][1]
+            arr[0] = uvs[0][0]
+            arr[1] = uvs[0][1]
             c.uv_candidates = tuple(arr)
             c.uv = uvs[0]
             c.x_world = (p_world.x, p_world.y, p_world.z)
@@ -2100,7 +1990,7 @@ class PBA_LM_OT_pick_island_vertices(bpy.types.Operator):
             _set_status(
                 scene,
                 f"Вершина {self._clicks}: v{vi}, "
-                f"{n} UV-вариант(ов)")
+                f"{len(uvs)} UV-вариант(ов)")
 
             # Обновить панель
             if context.area is not None:
@@ -2142,30 +2032,15 @@ def _commit_island(scene):
     if pba.pending_px_count != 4:
         return
 
-    # Собираем кандидатов
-    candidates_per_corner = []
+    # Проверка: UV должны быть уникальны
+    unique = set()
     for c in pba.pending_island_corners:
-        n = c.n_uv_candidates
-        if n == 0:
-            candidates_per_corner.append([(c.uv[0], c.uv[1])])
-        else:
-            lst = []
-            for k in range(n):
-                lst.append((c.uv_candidates[k * 2],
-                            c.uv_candidates[k * 2 + 1]))
-            candidates_per_corner.append(lst)
-
-    px = list(pba.pending_corners_px)
-    layout_px = [(px[i * 2], px[i * 2 + 1]) for i in range(4)]
-
-    combo, rmse, params = _fit_best_uv_combination(
-        candidates_per_corner, layout_px, verbose=True)
-
-    if combo is not None:
-        for i, c in enumerate(pba.pending_island_corners):
-            u, v = candidates_per_corner[i][combo[i]]
-            c.uv = (u, v)
-            c.fit_residual = rmse
+        unique.add((round(c.uv[0], 4), round(c.uv[1], 4)))
+    if len(unique) < 4:
+        _set_status(scene,
+                    f"UV углов не уникальны ({len(unique)} из 4). "
+                    f"Выберите более разнесённые вершины.")
+        return
 
     # Создание записи
     isl = pba.islands.add()
@@ -2192,12 +2067,8 @@ def _commit_island(scene):
     pba.pending_corners_px = (0.0,) * 8
     pba.pending_px_count = 0
 
-    if rmse is not None:
-        _set_status(scene,
-                    f"Остров {isl.id}: UV-fit rmse={rmse:.5f}")
-    else:
-        _set_status(scene,
-                    f"Остров {isl.id}: UV-fit не сошёлся")
+    _set_status(scene,
+                    f"Остров {isl.id} добавлен.")
 
 
 class PBA_LM_OT_commit_island(bpy.types.Operator):
