@@ -80,7 +80,7 @@ class PBA_VM_PT_main(bpy.types.Panel):
         col = box.column(align=True)
         col.operator("pba_vm.pick_3d", icon='VERTEXSEL')
         col.operator("pba_vm.pick_2d", icon='MOUSE_LMB')
-        
+
         if pba.correspondences:
             box.separator()
             active = sum(1 for c in pba.correspondences if c.enabled)
@@ -139,6 +139,10 @@ class PBA_VM_PT_main(bpy.types.Panel):
 
         box.operator("pba_vm.clear_pairs", text="Clear All", icon='TRASH')
         box.operator("pba_vm.enable_all", text="Enable All", icon='RESTRICT_VIEW_OFF')
+
+        row = box.row(align=True)
+        row.prop(pba, "show_2d_overlay", toggle=True,
+                 icon='HIDE_OFF', text="Show 2D Markers")
 
         # Nudge
         box = layout.box()
