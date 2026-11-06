@@ -1,0 +1,83 @@
+import bpy
+import os
+
+
+class PBA_AM_PT_main(bpy.types.Panel):
+    bl_label = "PT Assembly Manager"
+    bl_idname = "PT_AM_PT_main"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "PT Mapper"
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        pba = scene.pba_am
+
+        # Создание компонента
+        box = layout.box()
+        box.label(text="Create Component", icon='MESH_DATA')
+        box.prop(pba, "component_id")
+        box.prop(pba, "components_dir", text="Dir")
+        box.operator("pba_am.create_component", icon='FILE_NEW')
+        box.label(text="(выделите объекты → нажмите)", icon='INFO')
+
+        # Сборка
+        box = layout.box()
+        box.label(text="Assembly", icon='FILE_BLEND')
+
+        blend_path = bpy.data.filepath
+        if blend_path:
+            box.label(text=os.path.basename(blend_path),
+                        icon='CHECKMARK')
+            base = os.path.splitext(os.path.basename(blend_path))[0]
+            box.label(text=f"{base}.assembly.json", icon='FILE')
+        else:
+            box.label(text=".blend не сохранён", icon='ERROR')
+            box.label(text="File → Save As...", icon='INFO')
+
+        row = box.row(align=True)
+        row.enabled = bool(blend_path)
+        row.operator("pba_am.load_assembly", text="Load",
+                        icon='FILE_FOLDER')
+        row.operator("pba_am.save_assembly", text="Save",
+                        icon='FILE_TICK')
+
+        # Импорт
+        box = layout.box()
+        box.label(text="Import Component", icon='IMPORT')
+        box.operator("pba_am.import_component",
+                        text="Import mesh.blend...", icon='ADD')
+
+        # Список экземпляров
+        box = layout.box()
+        box.label(text=f"Instances ({len(pba.instances)})",
+                    icon='OUTLINER_COLLECTION')
+        if not pba.instances:
+            box.label(text="Нет компонентов", icon='INFO')
+        else:
+            for i, inst in enumerate(pba.instances):
+                active = (i == pba.active_instance_index)
+                icon = 'RADIOBUT_ON' if active else 'RADIOBUT_OFF'
+                row = box.row(align=True)
+                op_sel = row.operator(
+                    "pba_am.select_instance",
+                    text=inst.instance_id, icon=icon, emboss=active)
+                op_sel.index = i
+                row.label(text=f"[{inst.component_id}]")
+                op = row.operator("pba_am.remove_instance",
+                                    text="", icon='X')
+                op.index = i
+
+        # Валидация
+        box = layout.box()
+        box.operator("pba_am.validate", icon='CHECKMARK')
+
+        # Статус
+        box = layout.box()
+        box.label(text="Status", icon='INFO')
+        for line in (pba.status_msg or "—").split("\n")[-3:]:
+            box.label(text=line)
+
+
+classes = (PBA_AM_PT_main,)
