@@ -30,6 +30,7 @@ from mathutils import Matrix, Vector
 
 from .exif import camera_params, detect_native_resolution, read_exif, to_float
 from .solver import pose_refine_multistart
+from . import transfer_core
 
 PBA_VERTEX_ID_ATTR = "pba_vertex_id"
 
@@ -42,79 +43,85 @@ def get_uuid_attribute(mesh, create=False):
 
 
 def _get_uuid_layer_from_bmesh(obj):
-    import bmesh
-
     bm = bmesh.from_edit_mesh(obj.data)
     return bm, bm.verts.layers.int.get(PBA_VERTEX_ID_ATTR)
 
 
-def get_vertex_uuid(obj, vertex_index):
+def _get_vertex_uuid(obj, vertex_index):
+    if vertex_index < 0:
+        return 0
+
     # Edit Mode: читаем через bmesh
-    if bpy.context.mode == "EDIT_MESH" and bpy.context.active_object == obj:
-        bm, layer = _get_uuid_layer_from_bmesh(obj)
-        if layer is None:
-            return 0
+    if (bpy.context.mode == 'EDIT_MESH'
+            and bpy.context.active_object == obj):
+        bm = bmesh.from_edit_mesh(obj.data)
         bm.verts.ensure_lookup_table()
-        if vertex_index < 0 or vertex_index >= len(bm.verts):
+        if vertex_index >= len(bm.verts):
+            return 0
+        layer = bm.verts.layers.int.get(PBA_VERTEX_ID_ATTR)
+        if layer is None:
             return 0
         return int(bm.verts[vertex_index][layer])
 
-    # Object Mode: обычный путь
-    attr = get_uuid_attribute(obj.data, create=False)
-    if attr is None or len(attr.data) == 0:
+    # Object Mode
+    attr = obj.data.attributes.get(PBA_VERTEX_ID_ATTR)
+    if attr is None or vertex_index >= len(attr.data):
         return 0
-    n = len(obj.data.vertices)
-    if vertex_index < 0 or vertex_index >= n:
-        return 0
-    try:
-        return int(attr.data[vertex_index].value)
-    except Exception:
-        return 0
+    return int(attr.data[vertex_index].value)
 
 
-def find_vertex_by_uuid(obj, uuid_val, hint_world=None):
-    if uuid_val <= 0:
-        return -1, 0
-
-    # Собираем UUID всех вершин
-    if bpy.context.mode == "EDIT_MESH" and bpy.context.active_object == obj:
-        bm, layer = _get_uuid_layer_from_bmesh(obj)
-        if layer is None:
-            return -1, 0
+def _find_vertex_index_by_uuid(obj, local_uuid):
+    # Edit Mode: через bmesh
+    if (bpy.context.mode == 'EDIT_MESH'
+            and bpy.context.active_object == obj):
+        bm = bmesh.from_edit_mesh(obj.data)
         bm.verts.ensure_lookup_table()
-        candidates = [i for i, v in enumerate(bm.verts) if int(v[layer]) == uuid_val]
-    else:
-        attr = get_uuid_attribute(obj.data, create=False)
-        if attr is None or len(attr.data) == 0:
-            return -1, 0
-        n = min(len(obj.data.vertices), len(attr.data))
-        candidates = []
-        for i in range(n):
-            try:
-                if int(attr.data[i].value) == uuid_val:
-                    candidates.append(i)
-            except Exception:
-                continue
+        layer = bm.verts.layers.int.get(PBA_VERTEX_ID_ATTR)
+        if layer is None:
+            return -1
+        for i, v in enumerate(bm.verts):
+            if int(v[layer]) == local_uuid:
+                return i
+        return -1
 
-    if not candidates:
-        return -1, 0
-    if len(candidates) == 1:
-        return candidates[0], 1
+    # Object Mode
+    attr = obj.data.attributes.get(PBA_VERTEX_ID_ATTR)
+    if attr is None:
+        return -1
+    for i in range(len(attr.data)):
+        if int(attr.data[i].value) == local_uuid:
+            return i
+    return -1
 
-    if hint_world is not None:
-        M = obj.matrix_world
-        hint = Vector(hint_world)
-        best_i = candidates[0]
-        best_d = float("inf")
-        for i in candidates:
-            p = M @ obj.data.vertices[i].co
-            d = (p - hint).length
-            if d < best_d:
-                best_d = d
-                best_i = i
-        return best_i, len(candidates)
 
-    return candidates[0], len(candidates)
+def _get_component_key(obj, vertex_index):
+    """Возвращает (instance_id, obj_original_name, local_uuid)."""
+    iid = obj.get("pba_instance_id", "")
+    orig = obj.get("pba_original_name", obj.name)
+    uuid = _get_vertex_uuid(obj, vertex_index)
+    return (iid, orig, uuid)
+
+
+def _find_object_by_key(instance_id, orig_name):
+    """Находит объект по instance_id + оригинальному имени."""
+    if instance_id:
+        coll = bpy.data.collections.get(f"Instance_{instance_id}")
+        if coll is None:
+            return None
+        return next((o for o in coll.objects
+                     if o.get("pba_original_name") == orig_name), None)
+    return bpy.data.objects.get(orig_name)
+
+
+def _find_vertex_by_key(instance_id, orig_name, local_uuid):
+    """Возвращает (obj, vertex_index) или (None, -1)."""
+    obj = _find_object_by_key(instance_id, orig_name)
+    if obj is None or obj.type != 'MESH':
+        return (None, -1)
+    vi = _find_vertex_index_by_uuid(obj, local_uuid)
+    if vi < 0:
+        return (None, -1)
+    return (obj, vi)
 
 
 DEFAULT_LENS_MM = 50.0
@@ -173,18 +180,16 @@ def _build_json_data(scene, path, W, H, cam_obj):
 
     corrs_data = []
     for i, c in enumerate(pba.correspondences):
-        item = {
+        corrs_data.append({
             "index": i,
+            "instance_id": c.instance_id,
             "obj": c.obj_name,
-            "vertex": int(c.vertex_index),
+            "local_uuid": int(c.local_uuid),
             "x3d": [float(c.x3d[0]), float(c.x3d[1]), float(c.x3d[2])],
             "x2d": [float(c.x2d[0]), float(c.x2d[1])],
             "enabled": bool(c.enabled),
             "last_error_px": float(c.last_error),
-        }
-        if c.vertex_uuid > 0:
-            item["vertex_uuid"] = int(c.vertex_uuid)
-        corrs_data.append(item)
+        })
 
     active = [c for c in pba.correspondences if c.enabled]
     errors = [c.last_error for c in active if c.last_error >= 0.0]
@@ -292,58 +297,31 @@ def _apply_json_data(scene, data, path, W, H, cam_obj):
     pba.use_k2 = bool(solve.get("use_k2", False))
     pba.huber_delta = float(solve.get("huber_delta", 0.0))
 
-    pba.correspondences.clear()
     restored = 0
     skipped = 0
-    skipped_uuid = 0
-    dupes_resolved = 0
+    skipped_key = 0
     for cd in data.get("correspondences", []):
+        iid = cd.get("instance_id", "")
         obj_name = cd.get("obj", "")
-        vertex_uuid = int(cd.get("vertex_uuid", 0))
-        vertex_idx = int(cd.get("vertex", -1))
+        local_uuid = int(cd.get("local_uuid", 0))
 
-        obj = scene.objects.get(obj_name)
-        if obj is None or obj.type != "MESH":
-            print(f"[PBA VM] пропуск: объект '{obj_name}' не найден")
-            skipped += 1
+        if local_uuid <= 0:
+            print(f"[PBA VM] пропуск: нет local_uuid для "
+                  f"{iid}/{obj_name}")
+            skipped_key += 1
             continue
 
-        # Приоритет — UUID
-        resolved_idx = -1
-        if vertex_uuid > 0:
-            hint = None
-            x3d_raw = cd.get("x3d")
-            if x3d_raw and len(x3d_raw) == 3:
-                hint = (float(x3d_raw[0]), float(x3d_raw[1]), float(x3d_raw[2]))
-            resolved_idx, n_cand = find_vertex_by_uuid(
-                obj, vertex_uuid, hint_world=hint
-            )
-            if resolved_idx < 0:
-                print(f"[PBA VM] пропуск: {obj_name} uuid={vertex_uuid} не найден")
-                skipped_uuid += 1
-                continue
-            if n_cand > 1:
-                dupes_resolved += 1
-                print(
-                    f"[PBA VM] {obj_name} uuid={vertex_uuid}: "
-                    f"{n_cand} вершин, выбрана ближайшая к x3d"
-                )
-        else:
-            if 0 <= vertex_idx < len(obj.data.vertices):
-                resolved_idx = vertex_idx
-            else:
-                print(
-                    f"[PBA VM] пропуск: {obj_name} "
-                    f"v{vertex_idx} вне диапазона "
-                    f"({len(obj.data.vertices)} вершин)"
-                )
-                skipped += 1
-                continue
+        obj, vi = _find_vertex_by_key(iid, obj_name, local_uuid)
+        if obj is None:
+            print(f"[PBA VM] пропуск: {iid}/{obj_name}/"
+                  f"uuid={local_uuid} не найден в сцене")
+            skipped_key += 1
+            continue
 
         c = pba.correspondences.add()
+        c.instance_id = iid
         c.obj_name = obj_name
-        c.vertex_index = resolved_idx
-        c.vertex_uuid = vertex_uuid
+        c.local_uuid = local_uuid
         x3d = cd.get("x3d", [0.0, 0.0, 0.0])
         c.x3d[0] = float(x3d[0])
         c.x3d[1] = float(x3d[1])
@@ -356,16 +334,10 @@ def _apply_json_data(scene, data, path, W, H, cam_obj):
         restored += 1
 
     rmse = float(solve.get("rmse_px", 0.0))
-    parts = [f"Восстановлено: {restored} пар"]
-    if skipped:
-        parts.append(f"пропущено {skipped}")
-    if skipped_uuid:
-        parts.append(f"потеряно по UUID {skipped_uuid}")
-    if dupes_resolved:
-        parts.append(f"разрешено дубликатов {dupes_resolved}")
-    if rmse > 0:
-        parts.append(f"RMSE {rmse:.2f}px")
-    msg = ", ".join(parts)
+    msg = (f"Восстановлено: {restored} пар"
+           + (f", пропущено {skipped}" if skipped else "")
+           + (f", потеряно {skipped_key}" if skipped_key else "")
+           + (f", RMSE {rmse:.2f}px" if rmse > 0 else ""))
     _set_status(scene, msg)
     logger.info(msg)
     return True
@@ -392,52 +364,32 @@ def _delete_old_camera(scene):
 
 
 def _sync_x3d_from_mesh(scene):
-    """Обновляет x3d по актуальному положению вершин. Работает
-    по UUID (если есть) или по индексу. Пары с большим расхождением
-    не перезаписываются, а помечаются."""
     import bmesh
-
     pba = scene.pba_vm
     updated = 0
     suspicious = 0
 
     edit_obj = None
     bm = None
-    if bpy.context.mode == "EDIT_MESH":
+    if bpy.context.mode == 'EDIT_MESH':
         edit_obj = bpy.context.active_object
-        if edit_obj is not None and edit_obj.type == "MESH":
+        if edit_obj is not None and edit_obj.type == 'MESH':
             bm = bmesh.from_edit_mesh(edit_obj.data)
             bm.verts.ensure_lookup_table()
 
     DRIFT_THRESHOLD = 0.20
 
     for c in pba.correspondences:
-        obj = scene.objects.get(c.obj_name)
-        if obj is None or obj.type != "MESH":
+        obj, vi = _find_vertex_by_key(
+            c.instance_id, c.obj_name, c.local_uuid)
+        if obj is None:
             continue
 
-        if c.vertex_uuid > 0:
-            hint = (c.x3d[0], c.x3d[1], c.x3d[2])
-            idx, _ = find_vertex_by_uuid(obj, c.vertex_uuid, hint_world=hint)
-            if idx < 0:
-                continue
-            if idx != c.vertex_index:
-                c.vertex_index = idx
+        if (edit_obj is not None and obj == edit_obj
+                and bm is not None and vi < len(bm.verts)):
+            co_local = bm.verts[vi].co
         else:
-            idx = c.vertex_index
-
-        if idx < 0 or idx >= len(obj.data.vertices):
-            continue
-
-        if (
-            edit_obj is not None
-            and obj == edit_obj
-            and bm is not None
-            and idx < len(bm.verts)
-        ):
-            co_local = bm.verts[idx].co
-        else:
-            co_local = obj.data.vertices[idx].co
+            co_local = obj.data.vertices[vi].co
 
         p_world = obj.matrix_world @ co_local
         old = Vector((c.x3d[0], c.x3d[1], c.x3d[2]))
@@ -445,17 +397,14 @@ def _sync_x3d_from_mesh(scene):
 
         if drift > DRIFT_THRESHOLD:
             suspicious += 1
-            print(
-                f"[PBA VM] ПОДОЗРИТЕЛЬНО: {c.obj_name} "
-                f"uuid={c.vertex_uuid} v{idx} — сдвиг {drift:.3f} м"
-            )
+            print(f"[PBA VM] ПОДОЗРИТЕЛЬНО: "
+                  f"{c.instance_id}/{c.obj_name}/uuid={c.local_uuid} "
+                  f"— сдвиг {drift:.3f} м")
             continue
 
-        if (
-            abs(c.x3d[0] - p_world.x) > 1e-9
-            or abs(c.x3d[1] - p_world.y) > 1e-9
-            or abs(c.x3d[2] - p_world.z) > 1e-9
-        ):
+        if (abs(c.x3d[0] - p_world.x) > 1e-9
+                or abs(c.x3d[1] - p_world.y) > 1e-9
+                or abs(c.x3d[2] - p_world.z) > 1e-9):
             c.x3d[0] = p_world.x
             c.x3d[1] = p_world.y
             c.x3d[2] = p_world.z
@@ -592,7 +541,9 @@ class PBA_VM_OT_load_photo(bpy.types.Operator):
         # камера на нативном сенсоре.
         render_lens = physical_lens * max_native / max_loaded
 
+        # Очищаем всё от старого фото
         _delete_old_camera(scene)
+        pba.correspondences.clear()
 
         cam_data = bpy.data.cameras.new(name=CAMERA_NAME)
         cam_data.lens = render_lens
@@ -631,23 +582,27 @@ class PBA_VM_OT_load_photo(bpy.types.Operator):
 
         scene.camera = cam_obj
         for o in context.view_layer.objects:
-            o.select_set(False)
+            if o is None:
+                continue
+            try:
+                o.select_set(False)
+            except Exception:
+                pass
         cam_obj.select_set(True)
         context.view_layer.objects.active = cam_obj
 
-        # Восстановление из JSON (если есть и разрешено)
-        if scene.pba_vm.restore_from_json:
-            json_path = os.path.splitext(path)[0] + ".vertices.json"
-            if os.path.exists(json_path):
-                try:
-                    with open(json_path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    _apply_json_data(
-                        scene, data, path, img.size[0], img.size[1], cam_obj
-                    )
-                except Exception as e:
-                    self.report({"WARNING"}, f"Ошибка чтения JSON {json_path}: {e}")
-                    _set_status(scene, f"Ошибка JSON: {e}")
+        # Восстановление из JSON (если есть)
+        json_path = os.path.splitext(path)[0] + ".vertices.json"
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                _apply_json_data(
+                    scene, data, path, img.size[0], img.size[1], cam_obj
+                )
+            except Exception as e:
+                self.report({"WARNING"}, f"Ошибка чтения JSON {json_path}: {e}")
+                _set_status(scene, f"Ошибка JSON: {e}")
 
         crop_info = ""
         if scene.pba_vm.native_source != "same":
@@ -676,11 +631,6 @@ class PBA_VM_OT_save_vertices(bpy.types.Operator):
     bl_description = "Сохранить координаты вершин в CSV в пикселях фото"
     bl_options = {"REGISTER"}
 
-    check_visibility: bpy.props.BoolProperty(
-        name="Проверять видимость",
-        description="Raycast: исключать вершины, закрытые другими гранями",
-        default=True,
-    )
 
     def execute(self, context):
         scene = context.scene
@@ -770,27 +720,46 @@ def _commit_pair(scene):
     if not (pba.pending_3d_set and pba.pending_2d_set):
         return
 
-    # Дубликат 3D-вершины
+    # Дубликат 3D-вершины — по композитному ключу
     for existing in pba.correspondences:
-        same_uuid = (
-            pba.pending_3d_uuid > 0 and existing.vertex_uuid == pba.pending_3d_uuid
-        )
-        same_idx = (
-            pba.pending_3d_uuid == 0
-            and existing.obj_name == pba.pending_3d_obj
-            and existing.vertex_index == pba.pending_3d_vertex
-        )
-        if existing.obj_name == pba.pending_3d_obj and (same_uuid or same_idx):
+        if (existing.instance_id == pba.pending_instance_id
+                and existing.obj_name == pba.pending_obj_name
+                and existing.local_uuid == pba.pending_local_uuid):
             pba.pending_3d_set = False
             pba.pending_2d_set = False
-            pba.pending_3d_obj = ""
-            pba.pending_3d_vertex = -1
-            pba.pending_3d_uuid = 0
-            print(
-                f"[PBA VM] пропущен дубликат 3D: "
-                f"{existing.obj_name} v{existing.vertex_index}"
-            )
+            pba.pending_instance_id = ""
+            pba.pending_obj_name = ""
+            pba.pending_local_uuid = 0
+            print(f"[PBA VM] пропущен дубликат: "
+                  f"{existing.instance_id}/{existing.obj_name}/"
+                  f"{existing.local_uuid}")
             return
+
+    # Близкий 2D-клик
+    px = pba.pending_x2d[0]
+    py = pba.pending_x2d[1]
+    for existing in pba.correspondences:
+        dx = existing.x2d[0] - px
+        dy = existing.x2d[1] - py
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist < 5.0:
+            print(f"[PBA VM] ВНИМАНИЕ: 2D-клик ({px:.1f},{py:.1f}) "
+                  f"в {dist:.1f}px от пары "
+                  f"{existing.instance_id}/{existing.obj_name}/"
+                  f"{existing.local_uuid}")
+
+    c = pba.correspondences.add()
+    c.instance_id = pba.pending_instance_id
+    c.obj_name = pba.pending_obj_name
+    c.local_uuid = pba.pending_local_uuid
+    c.x3d = pba.pending_x3d
+    c.x2d = pba.pending_x2d
+
+    pba.pending_3d_set = False
+    pba.pending_2d_set = False
+    pba.pending_instance_id = ""
+    pba.pending_obj_name = ""
+    pba.pending_local_uuid = 0
 
     # Близкий 2D-клик
     px = pba.pending_x2d[0]
@@ -803,15 +772,8 @@ def _commit_pair(scene):
             print(
                 f"[PBA VM] ВНИМАНИЕ: 2D-клик ({px:.1f},{py:.1f}) "
                 f"в {dist:.1f}px от пары "
-                f"{existing.obj_name} v{existing.vertex_index}"
+                f"{existing.obj_name} v{existing.local_uuid}"
             )
-
-    c = pba.correspondences.add()
-    c.obj_name = pba.pending_3d_obj
-    c.vertex_index = pba.pending_3d_vertex
-    c.vertex_uuid = pba.pending_3d_uuid
-    c.x3d = pba.pending_x3d
-    c.x2d = pba.pending_x2d
 
     pba.pending_3d_set = False
     pba.pending_2d_set = False
@@ -828,44 +790,47 @@ class PBA_VM_OT_pick_3d(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
         obj = context.active_object
-        if obj is None or obj.type != "MESH":
-            self.report({"ERROR"}, "Нужен активный mesh-объект")
-            return {"CANCELLED"}
-        if context.mode != "EDIT_MESH":
-            self.report({"ERROR"}, "Нужен Edit Mode")
-            return {"CANCELLED"}
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, "Нужен активный mesh-объект")
+            return {'CANCELLED'}
+        if context.mode != 'EDIT_MESH':
+            self.report({'ERROR'}, "Нужен Edit Mode")
+            return {'CANCELLED'}
 
+        import bmesh
         bm = bmesh.from_edit_mesh(obj.data)
         bm.verts.ensure_lookup_table()
         selected = [v for v in bm.verts if v.select]
         if len(selected) != 1:
-            self.report({"ERROR"}, f"Выделено {len(selected)} вершин, нужна 1")
-            return {"CANCELLED"}
+            self.report({'ERROR'},
+                        f"Выделено {len(selected)} вершин, нужна 1")
+            return {'CANCELLED'}
 
         v = selected[0]
         p_world = obj.matrix_world @ v.co
         pba = scene.pba_vm
-        uuid_val = get_vertex_uuid(obj, v.index)
+
+        iid, orig_name, local_uuid = _get_component_key(obj, v.index)
+        if local_uuid == 0:
+            print(f"[PBA VM] ВНИМАНИЕ: у вершины {obj.name} "
+                  f"v{v.index} нет UUID. Вершина не привязана к компоненту.")
+            self.report({'ERROR'},
+                        "У вершины нет UUID. Сохраните компонент "
+                        "через Component Mapper или назначьте UUID.")
+            return {'CANCELLED'}
+
         pba.pending_x3d = (p_world.x, p_world.y, p_world.z)
-        pba.pending_3d_obj = obj.name
-        pba.pending_3d_vertex = v.index
-        pba.pending_3d_uuid = uuid_val
+        pba.pending_instance_id = iid
+        pba.pending_obj_name = orig_name
+        pba.pending_local_uuid = local_uuid
         pba.pending_3d_set = True
 
-        if uuid_val == 0:
-            print(
-                f"[PBA VM] ВНИМАНИЕ: у вершины {obj.name} "
-                f"v{v.index} нет UUID. Запустите Assign UUIDs "
-                f"в PBA UV Exporter."
-            )
-
-        _commit_pair(scene)
+        iid_str = iid if iid else "—"
         _set_status(
             scene,
-            f"3D: {obj.name} v{v.index} = "
-            f"({p_world.x:.2f}, {p_world.y:.2f}, {p_world.z:.2f})",
-        )
-        return {"FINISHED"}
+            f"3D: {iid_str}/{orig_name}/uuid={local_uuid} = "
+            f"({p_world.x:.2f}, {p_world.y:.2f}, {p_world.z:.2f})")
+        return {'FINISHED'}
 
 
 class PBA_VM_OT_pick_2d(bpy.types.Operator):
@@ -1130,87 +1095,6 @@ classes += (
 )
 
 
-class PBA_VM_OT_diagnose_pairs(bpy.types.Operator):
-    bl_idname = "pba_vm.diagnose_pairs"
-    bl_label = "Diagnose Pairs"
-    bl_description = "Пересчитать ошибки по текущему положению камеры"
-
-    def execute(self, context):
-        scene = context.scene
-        cam = scene.camera
-        if cam is None or cam.type != "CAMERA":
-            self.report({"ERROR"}, "Нет активной камеры")
-            return {"CANCELLED"}
-
-        n = _sync_x3d_from_mesh(scene)
-        if n > 0:
-            print(f"[PBA VM] синхронизировано {n} 3D-координат")
-        pba = scene.pba_vm
-
-        corrs = [c for c in pba.correspondences if c.enabled]
-        # Отключённые — сброс ошибки
-        for c in pba.correspondences:
-            if not c.enabled:
-                c.last_error = -1.0
-
-        if not corrs:
-            self.report({"WARNING"}, "Нет активных пар")
-            return {"CANCELLED"}
-
-        W, H = _get_photo_size(scene)
-        if W == 0 or H == 0:
-            self.report({"ERROR"}, "Размер фото неизвестен")
-            return {"CANCELLED"}
-
-        f_px = pba.last_f_px if pba.last_f_px > 0 else 1.0
-        k1 = pba.last_k1
-        k2 = pba.last_k2
-        off_x = pba.crop_offset_x
-        off_y = pba.crop_offset_y
-
-        # Оценка ошибки через P-матрицу (согласовано с LM)
-        # LM минимизирует |P(X) - (x2d - off)|, поэтому используем
-        # ту же формулу.
-        D = np.diag([1.0, -1.0, -1.0, 1.0])
-        M_cv = D @ np.linalg.inv(np.array(np.array(cam.matrix_world)))
-        K = np.array(
-            [
-                [f_px, 0.0, W / 2.0],
-                [0.0, f_px, H / 2.0],
-                [0.0, 0.0, 1.0],
-            ]
-        )
-        P = K @ M_cv[:3, :]
-
-        errors = []
-        for c in corrs:
-            X = np.array([c.x3d[0], c.x3d[1], c.x3d[2], 1.0])
-            proj = P @ X
-            if proj[2] <= 1e-9:
-                err = 1e6
-            else:
-                u = proj[0] / proj[2]
-                v = proj[1] / proj[2]
-                u_adj = c.x2d[0] - off_x
-                v_adj = c.x2d[1] - off_y
-                err = ((u - u_adj) ** 2 + (v - v_adj) ** 2) ** 0.5
-            c.last_error = err
-            errors.append(err)
-
-        errs_sorted = sorted(errors)
-        median = errs_sorted[len(errs_sorted) // 2]
-        max_err = max(errors)
-        outliers = sum(1 for e in errors if e > 2.5 * median)
-
-        _set_status(
-            scene,
-            f"Диагностика ({len(corrs)} активных): медиана {median:.2f}px, "
-            f"макс {max_err:.2f}px, выбросов: {outliers}",
-        )
-        self.report({"INFO"}, f"Медиана {median:.2f}px")
-        return {"FINISHED"}
-
-
 class PBA_VM_OT_remove_outliers(bpy.types.Operator):
     bl_idname = "pba_vm.remove_outliers"
     bl_label = "Remove Outliers"
@@ -1261,7 +1145,6 @@ class PBA_VM_OT_remove_outliers(bpy.types.Operator):
 
 
 classes += (
-    PBA_VM_OT_diagnose_pairs,
     PBA_VM_OT_remove_outliers,
 )
 
@@ -1354,39 +1237,61 @@ class PBA_VM_OT_set_enabled(bpy.types.Operator):
         scene = context.scene
         pba = scene.pba_vm
 
-        obj_name, selected = _get_selected_vertex_indices(context)
-        if obj_name is None:
-            self.report({"ERROR"}, "Требуется Edit Mode с активным mesh-объектом")
-            return {"CANCELLED"}
-        if not selected:
-            self.report({"WARNING"}, "Не выделено ни одной вершины")
-            return {"CANCELLED"}
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, "Нужен активный mesh-объект")
+            return {'CANCELLED'}
+        if context.mode != 'EDIT_MESH':
+            self.report({'ERROR'}, "Нужен Edit Mode")
+            return {'CANCELLED'}
 
-        sel_set = set(selected)
+        import bmesh
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+
+        # Собираем local_uuid всех выделенных вершин
+        selected_uuids = set()
+        for v in bm.verts:
+            if not v.select:
+                continue
+            uuid_val = _get_vertex_uuid(obj, v.index)
+            if uuid_val > 0:
+                selected_uuids.add(uuid_val)
+
+        if not selected_uuids:
+            self.report({'WARNING'}, "Не выделено вершин с UUID")
+            return {'CANCELLED'}
+
+        iid = obj.get("pba_instance_id", "")
+        orig = obj.get("pba_original_name", obj.name)
+
         changed = 0
         for c in pba.correspondences:
-            if c.obj_name == obj_name and c.vertex_index in sel_set:
-                if c.enabled != self.enable:
-                    c.enabled = self.enable
-                    changed += 1
+            if c.instance_id != iid:
+                continue
+            if c.obj_name != orig:
+                continue
+            if c.local_uuid not in selected_uuids:
+                continue
+            if c.enabled != self.enable:
+                c.enabled = self.enable
+                changed += 1
 
         action = "Включено" if self.enable else "Отключено"
         active = sum(1 for c in pba.correspondences if c.enabled)
         _set_status(
             scene,
             f"{action}: {changed} пар. Активных: {active} "
-            f"из {len(pba.correspondences)}",
-        )
+            f"из {len(pba.correspondences)}")
 
-        # Автопересчёт, если достаточно активных пар
         if active >= 6 and scene.camera is not None:
             bpy.ops.pba_vm.solve_camera()
         elif active < 6:
             _set_status(
-                scene, f"{action}: {changed}. Активных {active} — мало для пересчёта."
-            )
-
-        return {"FINISHED"}
+                scene,
+                f"{action}: {changed}. Активных {active} — "
+                f"мало для пересчёта.")
+        return {'FINISHED'}
 
 
 class PBA_VM_OT_disable_selected(bpy.types.Operator):
@@ -1441,55 +1346,55 @@ class PBA_VM_OT_select_correspondence(bpy.types.Operator):
 
     def execute(self, context):
         import bmesh
-
         scene = context.scene
         pba = scene.pba_vm
 
         if not (0 <= self.index < len(pba.correspondences)):
-            return {"CANCELLED"}
+            return {'CANCELLED'}
         c = pba.correspondences[self.index]
 
-        obj = scene.objects.get(c.obj_name)
-        if obj is None or obj.type != "MESH":
-            self.report({"WARNING"}, f"Объект '{c.obj_name}' не найден в сцене")
-            return {"CANCELLED"}
+        obj, vi = _find_vertex_by_key(
+            c.instance_id, c.obj_name, c.local_uuid)
+        if obj is None:
+            self.report(
+                {'WARNING'},
+                f"Вершина {c.instance_id}/{c.obj_name}/"
+                f"uuid={c.local_uuid} не найдена в сцене")
+            return {'CANCELLED'}
 
-        if c.vertex_index < 0 or c.vertex_index >= len(obj.data.vertices):
-            self.report({"WARNING"}, f"Вершина {c.vertex_index} вне диапазона")
-            return {"CANCELLED"}
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
 
-        # Выйти из Edit Mode, если там
-        if context.mode != "OBJECT":
-            bpy.ops.object.mode_set(mode="OBJECT")
-
-        # Снять выделение со всех объектов
         for o in context.view_layer.objects:
-            o.select_set(False)
-
+            if o is None:
+                continue
+            try:
+                o.select_set(False)
+            except Exception:
+                pass
         obj.select_set(True)
         context.view_layer.objects.active = obj
 
-        # Войти в Edit Mode и выделить только нужную вершину
-        bpy.ops.object.mode_set(mode="EDIT")
-        bpy.ops.mesh.select_all(action="DESELECT")
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='DESELECT')
         bm = bmesh.from_edit_mesh(obj.data)
         bm.verts.ensure_lookup_table()
-        if c.vertex_index < len(bm.verts):
-            bm.verts[c.vertex_index].select = True
+        if 0 <= vi < len(bm.verts):
+            bm.verts[vi].select = True
             bm.verts.index_update()
         bmesh.update_edit_mesh(obj.data)
 
-        # 3D-курсор — в позицию вершины
-        v = obj.data.vertices[c.vertex_index]
+        v = obj.data.vertices[vi]
         p_world = obj.matrix_world @ v.co
         scene.cursor.location = p_world
 
+        iid_label = c.instance_id if c.instance_id else "—"
         _set_status(
             scene,
-            f"Выделена: {c.obj_name} v{c.vertex_index} "
-            f"({p_world.x:.2f}, {p_world.y:.2f}, {p_world.z:.2f})",
-        )
-        return {"FINISHED"}
+            f"Выделена: {iid_label}/{c.obj_name}/"
+            f"uuid={c.local_uuid} "
+            f"({p_world.x:.2f}, {p_world.y:.2f}, {p_world.z:.2f})")
+        return {'FINISHED'}
 
 
 classes += (
@@ -1609,43 +1514,41 @@ class PBA_VM_OT_sort_pairs(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        scene = context.scene
-        pba = scene.pba_vm
+        pba = context.scene.pba_vm
         n = len(pba.correspondences)
         if n < 2:
-            _set_status(scene, f"Пар {n}, сортировка не нужна")
-            return {"FINISHED"}
+            _set_status(context.scene, f"Пар {n}, сортировка не нужна")
+            return {'FINISHED'}
 
         data = []
         for c in pba.correspondences:
-            data.append(
-                {
-                    "obj_name": c.obj_name,
-                    "vertex_index": c.vertex_index,
-                    "vertex_uuid": c.vertex_uuid,
-                    "x3d": (c.x3d[0], c.x3d[1], c.x3d[2]),
-                    "x2d": (c.x2d[0], c.x2d[1]),
-                    "enabled": c.enabled,
-                    "last_error": c.last_error,
-                    "sort_key": (c.obj_name, c.x2d[1], c.x2d[0]),
-                }
-            )
+            data.append({
+                "instance_id": c.instance_id,
+                "obj_name": c.obj_name,
+                "local_uuid": c.local_uuid,
+                "x3d": tuple(c.x3d),
+                "x2d": tuple(c.x2d),
+                "enabled": c.enabled,
+                "last_error": c.last_error,
+                "sort_key": (c.instance_id or "\uffff",
+                             c.obj_name, c.local_uuid),
+            })
 
         data.sort(key=lambda d: d["sort_key"])
 
         pba.correspondences.clear()
         for d in data:
             c = pba.correspondences.add()
+            c.instance_id = d["instance_id"]
             c.obj_name = d["obj_name"]
-            c.vertex_index = d["vertex_index"]
-            c.vertex_uuid = d["vertex_uuid"]
+            c.local_uuid = d["local_uuid"]
             c.x3d = d["x3d"]
             c.x2d = d["x2d"]
             c.enabled = d["enabled"]
             c.last_error = d["last_error"]
 
-        _set_status(scene, f"Пары отсортированы: {n}")
-        return {"FINISHED"}
+        _set_status(context.scene, f"Пары отсортированы: {n}")
+        return {'FINISHED'}
 
 
 classes += (
@@ -1659,7 +1562,7 @@ def _draw_2d_markers():
     context = bpy.context
     scene = context.scene
     pba = getattr(scene, "pba_vm", None)
-    if pba is None or not pba.show_2d_overlay:
+    if pba is None:
         return
     if context.area is None or context.area.type != 'VIEW_3D':
         return
@@ -1746,19 +1649,89 @@ def unregister_overlay():
         _overlay_handle = None
 
 
-class PBA_VM_OT_toggle_2d_overlay(bpy.types.Operator):
-    bl_idname = "pba_vm.toggle_2d_overlay"
-    bl_label = "Toggle 2D Markers"
+class PBA_VM_OT_transfer_photo(bpy.types.Operator):
+    bl_idname = "pba_vm.transfer_photo"
+    bl_label = "Transfer This Photo"
+    bl_description = ("Создать PNG-слой с текстурами этого фото "
+                      "в <layout_dir>/transfers/")
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        pba = context.scene.pba_vm
-        pba.show_2d_overlay = not pba.show_2d_overlay
-        if context.area:
-            context.area.tag_redraw()
+        scene = context.scene
+        pba = scene.pba_vm
+
+        layout_path = bpy.path.abspath(pba.layout_path)
+        if not layout_path or not os.path.exists(layout_path):
+            self.report({'ERROR'}, "layout.quads.json не найден")
+            return {'CANCELLED'}
+
+        try:
+            with open(layout_path, 'r', encoding='utf-8') as f:
+                layout = json.load(f)
+        except Exception as e:
+            self.report({'ERROR'}, f"layout.quads.json: {e}")
+            return {'CANCELLED'}
+
+        cam_obj = scene.camera
+        if cam_obj is None or cam_obj.type != 'CAMERA':
+            self.report({'ERROR'}, "Нет активной камеры")
+            return {'CANCELLED'}
+
+        if not cam_obj.data.background_images:
+            self.report({'ERROR'}, "У камеры нет фонового изображения")
+            return {'CANCELLED'}
+        image = cam_obj.data.background_images[0].image
+        if image is None:
+            self.report({'ERROR'}, "Фоновое изображение отсутствует")
+            return {'CANCELLED'}
+        if not image.filepath:
+            self.report({'ERROR'}, "У изображения нет пути к файлу")
+            return {'CANCELLED'}
+
+        W_photo = float(image.size[0])
+        H_photo = float(image.size[1])
+        if W_photo == 0 or H_photo == 0:
+            self.report({'ERROR'}, "Изображение пустое")
+            return {'CANCELLED'}
+
+        f_px = float(pba.last_f_px)
+        if f_px <= 0:
+            lens = cam_obj.data.lens
+            sensor = cam_obj.data.sensor_width
+            fit = cam_obj.data.sensor_fit
+            if fit == 'VERTICAL':
+                f_px = lens / sensor * H_photo
+            elif fit == 'HORIZONTAL':
+                f_px = lens / sensor * W_photo
+            else:
+                f_px = lens / sensor * max(W_photo, H_photo)
+            print(f"[PBA VM] last_f_px=0, используем fallback "
+                  f"f_px={f_px:.1f}")
+
+        off_x = float(pba.crop_offset_x)
+        off_y = float(pba.crop_offset_y)
+
+        layout_dir = os.path.dirname(layout_path)
+        out_dir = os.path.join(layout_dir, "transfers")
+
+        try:
+            out_path, stats = transfer_core.process_photo(
+                scene, layout, image, cam_obj, out_dir,
+                f_px, off_x, off_y, verbose=True)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Transfer: {e}")
+            return {'CANCELLED'}
+
+        summary = ", ".join(f"{k}={v}" for k, v in stats.items() if v)
+        _set_status(
+            scene,
+            f"Transfer: {os.path.basename(out_path)} ({summary})")
+        self.report({'INFO'}, f"Сохранено: {out_path}")
         return {'FINISHED'}
 
 
 classes += (
-    PBA_VM_OT_toggle_2d_overlay,
+    PBA_VM_OT_transfer_photo,
 )

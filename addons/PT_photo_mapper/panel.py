@@ -30,43 +30,43 @@ class PBA_VM_PT_main(bpy.types.Panel):
         box = layout.box()
         box.label(text="Photo", icon='IMAGE_DATA')
         box.prop(pba, "photo_path", text="")
-        box.prop(pba, "restore_from_json", text="Restore from JSON")
 
         box = layout.box()
         box.label(text="Camera Start", icon='CAMERA_DATA')
         box.prop(pba, "camera_position", text="")
-        box.prop(pba, "crop_factor")
-        box = layout.box()
-        box.label(text="Manual Camera Override", icon='PREFERENCES')
-        box.prop(pba, "use_manual_camera")
-        sub = box.column(align=True)
-        sub.enabled = pba.use_manual_camera
-        row = sub.row(align=True)
-        row.prop(pba, "manual_native_width", text="Native W")
-        row.prop(pba, "manual_native_height", text="×")
-        sub.prop(pba, "manual_sensor_width")
-        sub.prop(pba, "manual_focal_length")
-        if pba.use_manual_camera:
-            hint = sub.row()
-            hint.label(text="0 = авто (из EXIF)", icon='INFO')
-        box = layout.box()
-        box.label(text="Crop Offset", icon='FULLSCREEN_EXIT')
-        row = box.row(align=True)
-        row.prop(pba, "crop_offset_x", text="X")
-        row.prop(pba, "crop_offset_y", text="Y")
-        hint = box.row()
-        hint.label(text="Подбор: начни с 0, смотри на визуальный "
-                        "сдвиг модели", icon='INFO')
+        row = box.row()
+        icon = 'TRIA_DOWN' if pba.manual_camera_show else 'TRIA_RIGHT'
+        row.prop(pba, "manual_camera_show",
+                    icon=icon, emboss=False,
+                    text="Manual Camera Override")
+
+        if pba.manual_camera_show:
+            box.prop(pba, "crop_factor")
+            sub = box.column(align=True)
+            sub.prop(pba, "use_manual_camera")
+            col = sub.column(align=True)
+            col.enabled = pba.use_manual_camera
+            row = col.row(align=True)
+            row.prop(pba, "manual_native_width", text="Native W")
+            row.prop(pba, "manual_native_height", text="×")
+            col.prop(pba, "manual_sensor_width")
+            col.prop(pba, "manual_focal_length")
+            if pba.use_manual_camera:
+                col.label(text="0 = авто (из EXIF)", icon='INFO')
+
+            box = layout.box()
+            box.label(text="Crop Offset", icon='FULLSCREEN_EXIT')
+            row = box.row(align=True)
+            row.prop(pba, "crop_offset_x", text="X")
+            row.prop(pba, "crop_offset_y", text="Y")
+            hint = box.row()
+            hint.label(text="Подбор: начни с 0, смотри на визуальный "
+                            "сдвиг модели", icon='INFO')
 
         col = layout.column(align=True)
         col.operator("pba_vm.load_photo", icon='CAMERA_DATA')
 
         op = col.operator("pba_vm.save_vertices", icon='EXPORT')
-        op.check_visibility = pba.visibility_check
-
-        box = layout.box()
-        box.label(text="Visibility", icon='HIDE_OFF')
-        box.prop(pba, "visibility_check")
 
         # Correspondences
         box = layout.box()
@@ -105,11 +105,10 @@ class PBA_VM_PT_main(bpy.types.Panel):
                                    text="", icon='ZOOM_SELECTED')
                 op_sel.index = i
 
-                #op_snap = row.operator("pba_vm.snap_to_click", text="", icon='SNAP_VERTEX')
-                #op_snap.index = i
-
-                label = f"{i+1}. {c.obj_name} v{c.vertex_index} → " \
-                        f"({c.x2d[0]:.0f}, {c.x2d[1]:.0f})"
+                iid_label = c.instance_id if c.instance_id else "—"
+                label = (f"{i+1}. {iid_label}/{c.obj_name}/"
+                     f"u{c.local_uuid} → "
+                     f"({c.x2d[0]:.0f}, {c.x2d[1]:.0f})")
                 row.label(text=label, icon=icon)
                 if c.enabled and c.last_error >= 0:
                     row.label(text=f"{c.last_error:.1f}px")
@@ -121,7 +120,6 @@ class PBA_VM_PT_main(bpy.types.Panel):
         # Управление
         row = box.row(align=True)
         row.operator("pba_vm.solve_camera", text="Solve", icon='CAMERA_DATA')
-        row.operator("pba_vm.diagnose_pairs", text="Diagnose", icon='VIEWZOOM')
         row.operator("pba_vm.remove_outliers", text="Outliers", icon='FILTER')
 
         row = box.row(align=True)
@@ -137,41 +135,52 @@ class PBA_VM_PT_main(bpy.types.Panel):
         row.operator("pba_vm.sort_pairs", text="Sort Pairs",
                  icon='SORTALPHA')
 
-        box.operator("pba_vm.clear_pairs", text="Clear All", icon='TRASH')
         box.operator("pba_vm.enable_all", text="Enable All", icon='RESTRICT_VIEW_OFF')
+        box.operator("pba_vm.clear_pairs", text="Clear All", icon='TRASH')
 
-        row = box.row(align=True)
-        row.prop(pba, "show_2d_overlay", toggle=True,
-                 icon='HIDE_OFF', text="Show 2D Markers")
+        # Transfer
+        box = layout.box()
+        box.label(text="Transfer", icon='EXPORT')
+        box.prop(pba, "layout_path", text="Layout JSON")
+        box.operator("pba_vm.transfer_photo",
+                     text="Transfer This Photo", icon='FILE_NEW')
+        box.label(text="→ <layout_dir>/transfers/<photo>.png",
+                  icon='INFO')
 
         # Nudge
         box = layout.box()
-        box.label(text="Nudge (Edit Mode)", icon='ARROW_LEFTRIGHT')
-        box.prop(pba, "nudge_step", text="Шаг, м")
+        row = box.row()
+        icon = 'TRIA_DOWN' if pba.nudge_show else 'TRIA_RIGHT'
+        row.prop(pba, "nudge_show",
+                    icon=icon, emboss=False,
+                    text="Nudge (Edit Mode)")
 
-        row = box.row(align=True)
-        op = row.operator("pba_vm.nudge_vertex", text="−X")
-        op.axis = 'X'
-        op.direction = -1
-        op = row.operator("pba_vm.nudge_vertex", text="+X")
-        op.axis = 'X'
-        op.direction = 1
+        if pba.nudge_show:
+            box.prop(pba, "nudge_step", text="Шаг, м")
 
-        row = box.row(align=True)
-        op = row.operator("pba_vm.nudge_vertex", text="−Y")
-        op.axis = 'Y'
-        op.direction = -1
-        op = row.operator("pba_vm.nudge_vertex", text="+Y")
-        op.axis = 'Y'
-        op.direction = 1
+            row = box.row(align=True)
+            op = row.operator("pba_vm.nudge_vertex", text="−X")
+            op.axis = 'X'
+            op.direction = -1
+            op = row.operator("pba_vm.nudge_vertex", text="+X")
+            op.axis = 'X'
+            op.direction = 1
 
-        row = box.row(align=True)
-        op = row.operator("pba_vm.nudge_vertex", text="−Z")
-        op.axis = 'Z'
-        op.direction = -1
-        op = row.operator("pba_vm.nudge_vertex", text="+Z")
-        op.axis = 'Z'
-        op.direction = 1
+            row = box.row(align=True)
+            op = row.operator("pba_vm.nudge_vertex", text="−Y")
+            op.axis = 'Y'
+            op.direction = -1
+            op = row.operator("pba_vm.nudge_vertex", text="+Y")
+            op.axis = 'Y'
+            op.direction = 1
+
+            row = box.row(align=True)
+            op = row.operator("pba_vm.nudge_vertex", text="−Z")
+            op.axis = 'Z'
+            op.direction = -1
+            op = row.operator("pba_vm.nudge_vertex", text="+Z")
+            op.axis = 'Z'
+            op.direction = 1
 
         box = layout.box()
         box.label(text="Status", icon='INFO')
