@@ -1672,6 +1672,14 @@ class PBA_VM_OT_transfer_photo(bpy.types.Operator):
             self.report({'ERROR'}, f"layout.quads.json: {e}")
             return {'CANCELLED'}
 
+        """Выйти из Edit/других мод в Object Mode, если где-то активен edit."""
+        obj = bpy.context.object
+        if obj is not None and obj.mode != 'OBJECT':
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except RuntimeError:
+                pass
+
         cam_obj = scene.camera
         if cam_obj is None or cam_obj.type != 'CAMERA':
             self.report({'ERROR'}, "Нет активной камеры")

@@ -65,13 +65,37 @@ class PBA_AM_PT_main(bpy.types.Panel):
                     text=inst.instance_id, icon=icon, emboss=active)
                 op_sel.index = i
                 row.label(text=f"[{inst.component_id}]")
+                # Индикатор устаревания
+                stale = False
+                if inst.component_mtime > 0 and inst.component_path:
+                    mp = os.path.join(inst.component_path, "mesh.blend")
+                    if os.path.exists(mp):
+                        try:
+                            if os.path.getmtime(mp) > inst.component_mtime + 1.0:
+                                stale = True
+                        except Exception:
+                            pass
+                if stale:
+                    row.label(text="", icon='ERROR')
+                if inst.has_local_changes:
+                    row.label(text="", icon='UNLINKED')
+                op = row.operator("pba_am.publish_instance",
+                                    text="", icon='IMPORT')
+                op.index = i
+                op = row.operator("pba_am.reload_component",
+                                    text="", icon='FILE_REFRESH')
+                op.index = i
                 op = row.operator("pba_am.remove_instance",
                                     text="", icon='X')
                 op.index = i
 
         # Валидация
         box = layout.box()
-        box.operator("pba_am.validate", icon='CHECKMARK')
+        row = box.row(align=True)
+        row.operator("pba_am.reload_all", text="Reload All",
+                     icon='FILE_REFRESH')
+        row.operator("pba_am.validate", text="Validate",
+                     icon='CHECKMARK')
 
         # Статус
         box = layout.box()

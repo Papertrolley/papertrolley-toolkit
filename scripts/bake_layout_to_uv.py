@@ -16,33 +16,56 @@
 """
 Обратный bake: выкройка → UV-текстура.
 
-Читает PNG, полученный из transfer_blender.py, и «разворачивает»
-его обратно в UV-пространство модели через гомографии островов.
+Читает PNG (результат transfer + composite), «разворачивает» его
+обратно в UV-пространство модели через гомографии островов,
+описанных в layout.quads.json формата PaperBus Toolkit.
 
-Запуск:
+Группировка по композитному ключу (instance_id, obj_name, uv_map).
+Объект в сцене ищется как "<instance_id>__<obj_name>".
+Материал назначается через slot.link = 'OBJECT' — не задевает
+другие instance, разделяющие mesh data.
+
+Запуск (CLI):
     blender --background model.blend --python bake_layout_to_uv.py -- \\
         --layout layout.quads.json \\
         --layout-png result.png \\
-        --out uv_baked.png \\
-        [--size 4096] [--no-apply] [--verbose]
+        --out uv_baked/ \\
+        [--size 4096] [--no-apply] [--verbose] [--save-blend out.blend]
+
+Запуск (интерактивно, из Text Editor / Python Console):
+    from bake_layout_to_uv import run_bake_interactive
+    run_bake_interactive(
+        layout_path=".../layout.quads.json",
+        layout_png=".../sheet_composite.png",
+        output_dir=".../uv_baked/",
+        size=4096,
+        verbose=True,
+    )
 """
 
 import argparse
 import json
 import os
 import sys
+from collections import defaultdict
 
 import bpy
 import numpy as np
 from PIL import Image
 
 
+# ====================== JSON ======================
+
 def load_json(path):
     with open(path, encoding='utf-8') as f:
         return json.load(f)
 
 
+# ====================== Гомография ======================
+
 def compute_homography(src_pts, dst_pts):
+    """H: src → dst. Использует SVD (DLT, без нормализации — ок для
+    4 точек bbox острова). Возвращает 3×3 float64 или None при вырождении."""
     A = []
     for (x, y), (u, v) in zip(src_pts, dst_pts):
         A.append([x, y, 1, 0, 0, 0, -u * x, -u * y, -u])
@@ -54,48 +77,83 @@ def compute_homography(src_pts, dst_pts):
     return H / n if n > 1e-12 else None
 
 
-def bake_islands_to_uv_per_object(layout, layout_arr, texture_size,
-                                    verbose=False):
-    """Возвращает dict: {obj_name: np.array (H, W, 4)}."""
-    from collections import defaultdict
+# ====================== Загрузка layout ======================
 
+def _validate_island(isl):
+    """Проверить, что запись острова соответствует новому формату
+    PaperBus Toolkit (layout.quads.json). Возвращает (ok, reason)."""
+    if "corners_uv" in isl and "corners_layout_px" in isl \
+            and "obj_name" in isl and "instance_id" in isl:
+        return True, None
+    if "corners" in isl and "id" in isl:
+        return False, ("старый формат layout — обновите Composer "
+                       "(нужен layout.quads.json нового формата)")
+    return False, "отсутствуют обязательные поля"
+
+
+def _group_islands(layout):
+    """Сгруппировать острова по (instance_id, obj_name, uv_map).
+    Возвращает dict и список ошибок валидации."""
+    by_key = defaultdict(list)
+    errors = []
+    for idx, isl in enumerate(layout.get("islands", [])):
+        ok, reason = _validate_island(isl)
+        if not ok:
+            errors.append(f"islands[{idx}]: {reason}")
+            continue
+        iid = isl.get("instance_id", "")
+        obj_name = isl.get("obj_name", "")
+        uv_map = isl.get("uv_map", "")
+        if not (iid and obj_name and uv_map):
+            errors.append(
+                f"islands[{idx}]: пустые instance_id/obj_name/uv_map "
+                f"({iid!r}, {obj_name!r}, {uv_map!r})")
+            continue
+        if len(isl.get("corners_uv", [])) < 4 \
+                or len(isl.get("corners_layout_px", [])) < 4:
+            errors.append(
+                f"islands[{idx}]: менее 4 углов "
+                f"(corners_uv={len(isl.get('corners_uv', []))}, "
+                f"corners_layout_px={len(isl.get('corners_layout_px', []))})")
+            continue
+        by_key[(iid, obj_name, uv_map)].append(isl)
+    return by_key, errors
+
+
+# ====================== Bake ======================
+
+def bake_islands_to_uv(layout, layout_arr, texture_size, verbose=False):
+    """Возвращает ({ (iid, obj_name, uv_map): np.array(H,W,4) }, total_px,
+    errors)."""
     src_h, src_w = layout_arr.shape[:2]
+    by_key, errors = _group_islands(layout)
 
-    # Сгруппируем острова по объекту
-    by_obj = defaultdict(list)
-    for isl in layout.get("islands", []):
-        corners = isl.get("corners", [])
-        if len(corners) < 4:
-            continue
-        obj_name = corners[0].get("obj", "")
-        if not obj_name:
-            continue
-        by_obj[obj_name].append(isl)
-
-    print(f"Объектов с островами: {len(by_obj)}")
+    print(f"Островов сгруппировано: "
+          f"{sum(len(v) for v in by_key.values())} "
+          f"в {len(by_key)} групп (instance, obj, uv_map)")
+    if errors:
+        for e in errors:
+            print(f"  WARN: {e}")
 
     results = {}
     total_written_all = 0
 
-    for obj_name, islands in by_obj.items():
+    for (iid, obj_name, uv_map), islands in by_key.items():
         uv_tex = np.zeros((texture_size, texture_size, 4), dtype=np.uint8)
         total_written = 0
 
         for isl in islands:
-            isl_id = isl.get("id", "?")
-            corners = isl["corners"]
-            layout_px = isl.get("corners_layout_px", [])
-            if len(layout_px) < 4:
-                continue
+            isl_id = isl.get("island_id", "?")
 
-            uv_pts = np.array([c["uv"][:2] for c in corners[:4]],
-                               dtype=np.float64)
-            layout_pts = np.array(layout_px[:4], dtype=np.float64)
+            uv_pts = np.array(isl["corners_uv"][:4], dtype=np.float64)
+            layout_pts = np.array(
+                isl["corners_layout_px"][:4], dtype=np.float64)
 
             H = compute_homography(layout_pts, uv_pts)
             if H is None:
                 if verbose:
-                    print(f"  {isl_id}: гомография вырождена")
+                    print(f"  [{iid}/{obj_name}] {isl_id}: "
+                          f"гомография вырождена")
                 continue
 
             x0 = max(0, int(np.floor(layout_pts[:, 0].min())))
@@ -126,6 +184,7 @@ def bake_islands_to_uv_per_object(layout, layout_arr, texture_size,
             u = h[0, ok] / w[ok]
             v = h[1, ok] / w[ok]
 
+            # Blender UV: (0,0) — левый-нижний; sheet PNG: (0,0) — левый-верхний
             tx = np.clip((u * texture_size).astype(np.int64),
                          0, texture_size - 1)
             ty = np.clip(((1.0 - v) * texture_size).astype(np.int64),
@@ -136,92 +195,147 @@ def bake_islands_to_uv_per_object(layout, layout_arr, texture_size,
             total_written += len(idx)
 
             if verbose:
-                print(f"  [{obj_name}] {isl_id}: {len(idx)} px")
+                print(f"  [{iid}/{obj_name} @ {uv_map}] {isl_id}: "
+                      f"{len(idx)} px")
 
         if total_written > 0:
-            results[obj_name] = uv_tex
+            results[(iid, obj_name, uv_map)] = uv_tex
             total_written_all += total_written
             if verbose:
-                print(f"[{obj_name}] итого: {total_written} px")
+                print(f"[{iid}/{obj_name} @ {uv_map}] итого: "
+                      f"{total_written} px")
 
     print(f"Всего пикселей: {total_written_all}")
-    return results, total_written_all
+    return results, total_written_all, errors
 
 
-def apply_to_model_per_object(textures, output_dir, verbose=False):
-    """Создаёт материалы по одному на объект с правильной текстурой."""
-    from collections import defaultdict
+# ====================== Применение ======================
+
+def _apply_one(bpy_obj, iid, obj_name, uv_map, uv_tex,
+               output_dir, verbose=False):
+    """Сохранить PNG, создать материал с UV Map node, назначить
+    через slot.link='OBJECT' (безопасно для шаренного mesh data)."""
+    # 1. Сохраняем PNG
+    png_name = f"uv_baked_{iid}__{obj_name}__{uv_map}.png"
+    tex_path = os.path.join(output_dir, png_name)
+    Image.fromarray(uv_tex, "RGBA").save(tex_path, "PNG")
+
+    # 2. Загружаем в Blender
+    img_name = f"UVBaked_{iid}__{obj_name}__{uv_map}"
+    if img_name in bpy.data.images:
+        bpy.data.images.remove(bpy.data.images[img_name])
+    img = bpy.data.images.load(tex_path, check_existing=False)
+    img.name = img_name
+
+    # 3. Материал
+    mat_name = f"UVBaked_{iid}__{obj_name}__{uv_map}"
+    mat = bpy.data.materials.get(mat_name)
+    if mat is None:
+        mat = bpy.data.materials.new(name=mat_name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+
+    tex_node = None
+    uv_node = None
+    bsdf = None
+    for node in nt.nodes:
+        if node.bl_idname == "ShaderNodeTexImage" and tex_node is None:
+            tex_node = node
+        elif node.bl_idname == "ShaderNodeUVMap" and uv_node is None:
+            uv_node = node
+        elif node.bl_idname == "ShaderNodeBsdfPrincipled" and bsdf is None:
+            bsdf = node
+
+    if bsdf is None:
+        bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+        bsdf.location = (0, 0)
+        out = next((n for n in nt.nodes
+                    if n.bl_idname == "ShaderNodeOutputMaterial"), None)
+        if out is None:
+            out = nt.nodes.new("ShaderNodeOutputMaterial")
+            out.location = (300, 0)
+        nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+
+    if uv_node is None:
+        uv_node = nt.nodes.new("ShaderNodeUVMap")
+        uv_node.location = (-600, 0)
+    uv_node.uv_map = uv_map
+
+    if tex_node is None:
+        tex_node = nt.nodes.new("ShaderNodeTexImage")
+        tex_node.location = (-300, 0)
+    tex_node.image = img
+
+    # связи: UVMap.UV → Image.Vector, Image.Color → BSDF.BaseColor
+    for l in list(tex_node.inputs["Vector"].links):
+        nt.links.remove(l)
+    nt.links.new(uv_node.outputs["UV"], tex_node.inputs["Vector"])
+    for l in list(bsdf.inputs["Base Color"].links):
+        nt.links.remove(l)
+    nt.links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+
+    # 4. Назначение. Используем slot.link='OBJECT' — материал живёт на
+    #    объекте, а не на mesh data. Критично, когда два instance
+    #    (hatch_standard, hatch_standard_2) делят один obj.data.
+    if len(bpy_obj.data.materials) == 0:
+        bpy_obj.data.materials.append(None)
+    slot = bpy_obj.material_slots[0]
+    slot.link = 'OBJECT'
+    slot.material = mat
+
+
+def apply_to_model(textures, output_dir, verbose=False):
+    """Раскладывает textures по объектам сцены. Возвращает (applied, errors)."""
+    # Группируем по (iid, obj_name), чтобы поймать случай нескольких uv_map
+    by_obj = defaultdict(dict)
+    for (iid, obj_name, uv_map), uv_tex in textures.items():
+        by_obj[(iid, obj_name)][uv_map] = uv_tex
 
     applied = 0
-    for obj_name, uv_tex in textures.items():
-        obj = bpy.data.objects.get(obj_name)
-        if obj is None or obj.type != 'MESH':
-            if verbose:
-                print(f"  объект '{obj_name}' не найден в сцене")
+    errors = []
+    for (iid, obj_name), uv_map_textures in by_obj.items():
+        scene_name = f"{iid}__{obj_name}"
+        bpy_obj = bpy.data.objects.get(scene_name)
+        if bpy_obj is None or bpy_obj.type != 'MESH':
+            errors.append(f"объект '{scene_name}' не найден в сцене")
             continue
 
-        # Сохраняем PNG
-        tex_path = os.path.join(output_dir,
-                                 f"uv_baked_{obj_name}.png")
-        Image.fromarray(uv_tex, "RGBA").save(tex_path, "PNG")
+        if len(uv_map_textures) > 1:
+            uvs = ", ".join(uv_map_textures.keys())
+            errors.append(
+                f"'{scene_name}': несколько uv_map ({uvs}) — "
+                f"используется первая, остальные сохранены на диск")
+        uv_map, uv_tex = next(iter(uv_map_textures.items()))
 
-        # Загружаем в Blender
-        tex_name = f"UVBaked_{obj_name}"
-        if tex_name in bpy.data.images:
-            bpy.data.images.remove(bpy.data.images[tex_name])
-        img = bpy.data.images.load(tex_path, check_existing=False)
-        img.name = tex_name
+        # Проверим, что UV-слой реально существует на меше
+        if uv_map not in [l.name for l in bpy_obj.data.uv_layers]:
+            errors.append(
+                f"'{scene_name}': UV-слой '{uv_map}' не найден на меше "
+                f"(есть: {[l.name for l in bpy_obj.data.uv_layers]})")
+            # всё равно применяем — материал валиден, пользователь разберётся
 
-        # Материал
-        mat_name = f"UVBaked_{obj_name}"
-        if mat_name in bpy.data.materials:
-            mat = bpy.data.materials[mat_name]
-        else:
-            mat = bpy.data.materials.new(name=mat_name)
-        mat.use_nodes = True
-        nt = mat.node_tree
+        _apply_one(bpy_obj, iid, obj_name, uv_map, uv_tex,
+                   output_dir, verbose=verbose)
 
-        tex_node = None
-        bsdf = None
-        for node in nt.nodes:
-            if node.bl_idname == "ShaderNodeTexImage" and tex_node is None:
-                tex_node = node
-            if node.bl_idname == "ShaderNodeBsdfPrincipled":
-                bsdf = node
-
-        if tex_node is None:
-            tex_node = nt.nodes.new("ShaderNodeTexImage")
-            tex_node.location = (-300, 0)
-        tex_node.image = img
-
-        if bsdf is not None:
-            for link in list(bsdf.inputs["Base Color"].links):
-                nt.links.remove(link)
-            nt.links.new(tex_node.outputs["Color"],
-                         bsdf.inputs["Base Color"])
-
-        # Назначаем материал объекту
-        obj.data.materials.clear()
-        obj.data.materials.append(mat)
+        # Если у объекта было несколько uv_map — сохраним их PNG на диск
+        for other_uv, other_tex in uv_map_textures.items():
+            if other_uv == uv_map:
+                continue
+            png_name = f"uv_baked_{iid}__{obj_name}__{other_uv}.png"
+            Image.fromarray(other_tex, "RGBA").save(
+                os.path.join(output_dir, png_name), "PNG")
 
         applied += 1
         if verbose:
-            print(f"  {obj_name}: текстура назначена")
+            print(f"  {scene_name}: назначен материал (UV: {uv_map})")
 
-    return applied
+    return applied, errors
 
 
-def run_bake_interactive(layout_path, layout_png, output_dir,
-                          size=4096, verbose=True):
-    """Интерактивный запуск: те же действия, но без argparse.
+# ====================== Точки входа ======================
 
-    Вызывается из Text Editor / Python Console в Blender.
-    Изменения применяются сразу — Blender открыт, результат виден."""
-    import os
-    import json
-    import numpy as np
-    from PIL import Image
-
+def _run(layout_path, layout_png, output_dir, size,
+         apply=True, verbose=False, save_blend="", ):
     print(f"Layout JSON: {layout_path}")
     print(f"Layout PNG:  {layout_png}")
     print(f"Output dir:  {output_dir}")
@@ -234,23 +348,43 @@ def run_bake_interactive(layout_path, layout_png, output_dir,
 
     os.makedirs(output_dir, exist_ok=True)
 
-    textures, total = bake_islands_to_uv_per_object(
+    textures, total, load_errors = bake_islands_to_uv(
         layout, layout_arr, size, verbose=verbose)
 
     if total == 0:
-        print("Ничего не записано")
-        return
+        print("Ничего не записано", file=sys.stderr if not bpy.app.background else sys.stdout)
+        return False
 
     print(f"Сохранено текстур: {len(textures)}")
 
-    n = apply_to_model_per_object(textures, output_dir,
-                                    verbose=verbose)
-    print(f"Текстур применено к объектам: {n}")
+    if apply:
+        applied, apply_errors = apply_to_model(
+            textures, output_dir, verbose=verbose)
+        print(f"Текстур применено к объектам: {applied}")
+        for e in apply_errors:
+            print(f"  WARN: {e}")
 
+    if apply and save_blend:
+        save_path = os.path.abspath(save_blend)
+        bpy.ops.wm.save_as_mainfile(filepath=save_path)
+        print(f"Blend сохранён: {save_path}")
+
+    return True
+
+
+def run_bake_interactive(layout_path, layout_png, output_dir,
+                          size=4096, verbose=True):
+    ok = _run(layout_path, layout_png, output_dir, size,
+              apply=True, verbose=verbose)
+    if not ok:
+        return
     # Force redraw всех 3D-вьюпортов
-    for area in bpy.context.screen.areas:
-        if area.type == 'VIEW_3D':
-            area.tag_redraw()
+    try:
+        for area in bpy.context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+    except Exception:
+        pass
     print("Готово. Переключись в Material Preview (Z)")
 
 
@@ -278,51 +412,21 @@ def main():
             print(f"Файл не найден: {path}", file=sys.stderr)
             sys.exit(1)
 
-    print(f"Layout JSON: {args.layout}")
-    print(f"Layout PNG:  {args.layout_png}")
-    print(f"Output dir:  {args.out}")
-    print(f"UV size:     {args.size}×{args.size}")
-
-    layout = load_json(args.layout)
-    layout_img = Image.open(args.layout_png).convert("RGBA")
-    layout_arr = np.array(layout_img)
-    print(f"Sheet: {layout_arr.shape[1]}×{layout_arr.shape[0]}")
-
-    # Создаём папку
-    os.makedirs(args.out, exist_ok=True)
-
-    textures, total = bake_islands_to_uv_per_object(
-        layout, layout_arr, args.size, verbose=args.verbose)
-
-    if total == 0:
-        print("Ничего не записано", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Сохранено текстур: {len(textures)}")
-
-    if not args.no_apply:
-        n = apply_to_model_per_object(textures, args.out,
-                                        verbose=args.verbose)
-        print(f"Текстур применено к объектам: {n}")
-        
-    if not args.no_apply and args.save_blend:
-        save_path = os.path.abspath(args.save_blend)
-        bpy.ops.wm.save_as_mainfile(filepath=save_path)
-        print(f"Blend сохранён: {save_path}")
+    ok = _run(args.layout, args.layout_png, args.out, args.size,
+              apply=not args.no_apply, verbose=args.verbose,
+              save_blend=args.save_blend)
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":
-    import sys
     if "--" in sys.argv and bpy.app.background:
-        # Режим CLI (blender --background)
         main()
     else:
-        # Интерактивный режим — параметры зашиты в коде
-        # Меняй эти строки под свои пути и запускай Run Script
+        # Интерактивный режим — подставьте свои пути и Run Script
         run_bake_interactive(
             layout_path="/path/to/layout.quads.json",
-            layout_png="/path/to/result.png",
-            output_dir="/path/to/out/",
+            layout_png="/path/to/sheet_composite.png",
+            output_dir="/path/to/uv_baked/",
             size=4096,
             verbose=True,
         )
