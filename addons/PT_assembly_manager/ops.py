@@ -477,9 +477,6 @@ def _on_depsgraph_update(scene, depsgraph):
     """
     global _pba_last_fp_check
 
-    print(f"[PBA AM DEBUG] handler fired, suppress={_PBA_SUPPRESS_DIRTY}, "
-          f"instances={len(getattr(getattr(scene, 'pba_am', None), 'instances', [])) if scene else 'no-scene'}")
-
     if _PBA_SUPPRESS_DIRTY:
         return
     if scene is None:

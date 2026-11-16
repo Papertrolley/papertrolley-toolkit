@@ -15,7 +15,7 @@
 bl_info = {
     "name": "PT Triangulation",
     "author": "PaperTroley",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > PT Model",
     "description": "Триангуляция 3D-точек по нескольким калиброванным фото",
@@ -33,9 +33,10 @@ class PBA_TRI_Click(bpy.types.PropertyGroup):
 
 
 class PBA_TRI_Correspondence(bpy.types.PropertyGroup):
+    instance_id: bpy.props.StringProperty(default="")
     obj_name: bpy.props.StringProperty(default="")
     vertex_index: bpy.props.IntProperty(default=-1)
-    vertex_uuid: bpy.props.IntProperty(default=0)
+    local_uuid: bpy.props.IntProperty(default=0)
     x2d: bpy.props.FloatVectorProperty(size=2, default=(0.0, 0.0))
     x_world: bpy.props.FloatVectorProperty(size=3, default=(0.0, 0.0, 0.0))
     enabled: bpy.props.BoolProperty(default=True)
@@ -48,6 +49,10 @@ class PBA_TRI_Photo(bpy.types.PropertyGroup):
     image_name: bpy.props.StringProperty(default="")
     width_px: bpy.props.IntProperty(default=0)
     height_px: bpy.props.IntProperty(default=0)
+    native_width_px: bpy.props.IntProperty(default=0)
+    native_height_px: bpy.props.IntProperty(default=0)
+    crop_offset_x: bpy.props.IntProperty(default=0)
+    crop_offset_y: bpy.props.IntProperty(default=0)
     lens_mm: bpy.props.FloatProperty(default=50.0)
     sensor_width_mm: bpy.props.FloatProperty(default=36.0)
     f_px: bpy.props.FloatProperty(default=0.0)

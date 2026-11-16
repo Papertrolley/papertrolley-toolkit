@@ -35,10 +35,6 @@ def register():
     bpy.app.handlers.depsgraph_update_post.append(ops._on_depsgraph_update)
     bpy.app.handlers.save_pre.append(ops._on_save_pre)
     bpy.app.handlers.load_post.append(ops._on_load_post)
-    print("[PBA AM] handlers:",
-          len(bpy.app.handlers.depsgraph_update_post),
-          len(bpy.app.handlers.save_pre),
-          len(bpy.app.handlers.load_post))
 
     if not bpy.app.timers.is_registered(ops._handlers_watchdog):
             bpy.app.timers.register(ops._handlers_watchdog,

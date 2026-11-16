@@ -27,6 +27,9 @@ from .core import make_P, triangulate
 
 
 PBA_VERTEX_ID_ATTR = "pba_vertex_id"
+# Композитный ключ — те же имена props, что в Assembly Manager
+PBA_INSTANCE_ID_PROP = "pba_instance_id"
+PBA_ORIGINAL_NAME_PROP = "pba_original_name"
 
 
 def _get_uuid_attr(mesh, create=False):
@@ -109,6 +112,29 @@ def find_vertex_by_uuid(obj, uuid_val, hint_world=None):
     return candidates[0], len(candidates)
 
 
+def _find_instance_object(scene, instance_id, obj_name):
+    """Найти mesh-объект по композитному ключу.
+
+    instance_id != ""  → ищем в коллекции Instance_<iid> объект
+                          с pba_original_name == obj_name.
+    instance_id == ""  → глобальный поиск по точному имени
+                          (local objects / старый формат).
+    Возвращает bpy.types.Object или None.
+    """
+    if instance_id:
+        coll = bpy.data.collections.get(f"Instance_{instance_id}")
+        if coll is None:
+            return None
+        for o in coll.objects:
+            if o.type != 'MESH':
+                continue
+            if o.get(PBA_ORIGINAL_NAME_PROP, "") == obj_name:
+                return o
+        return None
+    obj = scene.objects.get(obj_name)
+    return obj if obj is not None and obj.type == 'MESH' else None
+
+
 OUTPUT_OBJ_NAME = "Triangulated_Points"
 CAM_NAME_TPL = "PBA_TRI_Cam_{}"
 
@@ -122,6 +148,21 @@ def _ensure_slots(scene):
     p = scene.pba_tri
     while len(p.photos) < 3:
         p.photos.add()
+
+
+def _tag_redraw_views(context=None):
+    """Принудительный redraw всех VIEW_3D (включая sidebar-панель)."""
+    try:
+        if context is None:
+            context = bpy.context
+        screen = getattr(context, "screen", None)
+        if screen is None:
+            return
+        for area in screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+    except Exception:
+        pass
 
 
 def _remove_camera_by_name(scene, name):
@@ -240,7 +281,6 @@ class PBA_TRI_OT_load_slot(bpy.types.Operator):
             self.report({'ERROR'}, "Фото не найдено рядом с JSON")
             return {'CANCELLED'}
 
-        # Загружаем изображение
         try:
             img = bpy.data.images.load(photo_path, check_existing=True)
         except Exception as e:
@@ -249,9 +289,13 @@ class PBA_TRI_OT_load_slot(bpy.types.Operator):
 
         W = int(photo.get("width_px", img.size[0]))
         H = int(photo.get("height_px", img.size[1]))
-
         slot.width_px = W
         slot.height_px = H
+        slot.native_width_px = int(photo.get("native_width_px", W))
+        slot.native_height_px = int(photo.get("native_height_px", H))
+        slot.crop_offset_x = int(photo.get("crop_offset_x", 0))
+        slot.crop_offset_y = int(photo.get("crop_offset_y", 0))
+
         slot.image_name = img.name
         slot.lens_mm = float(cam_info.get("lens_mm", 50.0))
         slot.sensor_width_mm = float(cam_info.get("sensor_width_mm", 36.0))
@@ -266,7 +310,7 @@ class PBA_TRI_OT_load_slot(bpy.types.Operator):
             for i in range(16):
                 slot.matrix_world[i] = float(m_flat[i])
 
-        # Создаём камеру
+        # Камера
         cam_name = CAM_NAME_TPL.format(self.slot_index + 1)
         _remove_camera_by_name(scene, cam_name)
         cam_data = bpy.data.cameras.new(name=cam_name)
@@ -290,37 +334,42 @@ class PBA_TRI_OT_load_slot(bpy.types.Operator):
 
         slot.camera_name = cam_obj.name
 
-        # Соответствия
+        # Соответствия (композитный ключ: instance_id + obj + local_uuid)
         slot.correspondences.clear()
         missing_uuid = 0
         for cd in data.get("correspondences", []):
             if not cd.get("enabled", True):
                 continue
+            instance_id = cd.get("instance_id", "")
             obj_name = cd.get("obj", "")
-            v_uuid = int(cd.get("vertex_uuid", 0))
-            v_idx = int(cd.get("vertex", -1))
+            local_uuid = int(cd.get("local_uuid", 0))
+            v_idx = int(cd.get("vertex_index", -1))
             xw_raw = cd.get("x3d", [0.0, 0.0, 0.0])
 
-            # Восстановление индекса по UUID
             resolved_idx = v_idx
-            if v_uuid > 0:
-                obj = scene.objects.get(obj_name)
-                if obj is not None and obj.type == 'MESH':
+            if local_uuid > 0:
+                obj = _find_instance_object(scene, instance_id, obj_name)
+                if obj is not None:
                     hint = (float(xw_raw[0]), float(xw_raw[1]),
                             float(xw_raw[2]))
-                    idx, n_cand = find_vertex_by_uuid(
-                        obj, v_uuid, hint_world=hint)
+                    idx, _n = find_vertex_by_uuid(
+                        obj, local_uuid, hint_world=hint)
                     if idx >= 0:
                         resolved_idx = idx
                     else:
                         missing_uuid += 1
-                        print(f"[PBA TRI] {obj_name} uuid={v_uuid} "
-                              f"не найден в меше")
+                        print(f"[PBA TRI] {instance_id}/{obj_name} "
+                              f"uuid={local_uuid} не найден в меше")
+                else:
+                    missing_uuid += 1
+                    print(f"[PBA TRI] объект "
+                          f"'{instance_id}__{obj_name}' не найден")
 
             c = slot.correspondences.add()
+            c.instance_id = instance_id
             c.obj_name = obj_name
             c.vertex_index = resolved_idx
-            c.vertex_uuid = v_uuid
+            c.local_uuid = local_uuid
             c.x_world = (float(xw_raw[0]), float(xw_raw[1]),
                          float(xw_raw[2]))
             x2d = cd.get("x2d", [0.0, 0.0])
@@ -329,7 +378,7 @@ class PBA_TRI_OT_load_slot(bpy.types.Operator):
             c.enabled = True
 
         slot.loaded = True
-        tail = f", потеряно по UUID {missing_uuid}" if missing_uuid else ""
+        tail = f", потеряно по UUID: {missing_uuid}" if missing_uuid else ""
         _set_status(scene,
                     f"Слот {self.slot_index + 1}: загружено "
                     f"{len(slot.correspondences)} пар, "
@@ -348,26 +397,55 @@ class PBA_TRI_OT_activate_slot(bpy.types.Operator):
         _ensure_slots(scene)
         p = scene.pba_tri
         if not (0 <= self.slot_index < len(p.photos)):
+            self.report({'WARNING'},
+                        f"Индекс {self.slot_index} вне диапазона")
             return {'CANCELLED'}
+
         slot = p.photos[self.slot_index]
+
+        print(f"[PBA TRI] activate_slot: idx={self.slot_index}, "
+              f"loaded={slot.loaded}, "
+              f"cam_name='{slot.camera_name}', "
+              f"w={slot.width_px}, h={slot.height_px}")
+
         if not slot.loaded:
-            self.report({'WARNING'}, "Слот не загружен")
+            self.report({'WARNING'},
+                        f"Слот {self.slot_index + 1} не загружен "
+                        f"— нажмите Load")
+            _set_status(scene,
+                        f"Слот {self.slot_index + 1} не загружен")
             return {'CANCELLED'}
 
         cam = scene.objects.get(slot.camera_name)
         if cam is None or cam.type != 'CAMERA':
-            self.report({'ERROR'}, "Камера не найдена")
+            self.report({'ERROR'},
+                        f"Камера '{slot.camera_name}' не найдена "
+                        f"— перезагрузите слот")
+            _set_status(scene,
+                        f"Камера '{slot.camera_name}' не найдена")
             return {'CANCELLED'}
 
         scene.camera = cam
         p.active_slot = self.slot_index
 
-        # Синхронизируем разрешение рендера с фото
-        scene.render.resolution_x = slot.width_px
-        scene.render.resolution_y = slot.height_px
+        # Защита от width/height = 0 (если JSON был битый)
+        rx = slot.width_px if slot.width_px > 0 else scene.render.resolution_x
+        ry = slot.height_px if slot.height_px > 0 else scene.render.resolution_y
+        scene.render.resolution_x = rx
+        scene.render.resolution_y = ry
         scene.render.resolution_percentage = 100
 
-        _set_status(scene, f"Активен слот {self.slot_index + 1}")
+        # Принудительный redraw — без него сайдбар не обновляет иконку
+        try:
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+        except Exception:
+            pass
+
+        _set_status(scene,
+                    f"Активен слот {self.slot_index + 1} "
+                    f"({rx}×{ry}), камера: {cam.name}")
         return {'FINISHED'}
 
 
@@ -388,22 +466,23 @@ class PBA_TRI_OT_auto_triangulate(bpy.types.Operator):
             self.report({'ERROR'}, "Нужно минимум 2 загруженных слота")
             return {'CANCELLED'}
 
-        # Индексы слотов
         loaded_slots = [(i, s) for i, s in enumerate(p.photos) if s.loaded]
 
-        # Группируем: приоритет по (obj_name, vertex_uuid),
-        # fallback по (obj_name, vertex_index)
+        # Композитный ключ: (instance_id, obj_name, kind, value).
+        # Приоритет local_uuid, fallback vertex_index (для очень
+        # старых JSON без UUID).
         groups = {}
         for i, slot in loaded_slots:
             for c in slot.correspondences:
-                if c.vertex_uuid > 0:
-                    key = (c.obj_name, "uuid", c.vertex_uuid)
+                if c.local_uuid > 0:
+                    key = (c.instance_id, c.obj_name,
+                           "uuid", c.local_uuid)
                 else:
-                    key = (c.obj_name, "idx", c.vertex_index)
+                    key = (c.instance_id, c.obj_name,
+                           "idx", c.vertex_index)
                 groups.setdefault(key, []).append(
                     (i, (c.x2d[0], c.x2d[1])))
 
-        # Оставляем только ключи, встречающиеся в 2+ слотах
         multi = {k: v for k, v in groups.items() if len(v) >= 2}
         print(f"[PBA TRI] групп всего: {len(groups)}, "
               f"с 2+ слотами: {len(multi)}")
@@ -516,6 +595,7 @@ class PBA_TRI_OT_pick_click(bpy.types.Operator):
                 scene,
                 f"Слот {p.active_slot + 1}: ({u:.1f}, {v:.1f})")
             context.workspace.status_text_set(None)
+            _tag_redraw_views(context)
             return {'FINISHED'}
 
         return {'RUNNING_MODAL'}

@@ -44,7 +44,10 @@ class PBA_TRI_PT_main(bpy.types.Panel):
             sub = box.box()
             row = sub.row(align=True)
             icon = 'RADIOBUT_ON' if active else 'RADIOBUT_OFF'
-            row.label(text=f"Слот {i + 1}", icon=icon)
+            op = row.operator("pba_tri.activate_slot",
+                              text=f"Слот {i + 1}", icon=icon,
+                              emboss=False)
+            op.slot_index = i
 
             row = sub.row(align=True)
             row.prop(slot, "json_path", text="")
@@ -58,10 +61,20 @@ class PBA_TRI_PT_main(bpy.types.Panel):
             op.slot_index = i
 
             if slot.loaded:
+                # Разбивка пар по instance — полезно при сборках
+                # с несколькими копиями одного компонента
+                by_iid = {}
+                for c in slot.correspondences:
+                    by_iid[c.instance_id] = by_iid.get(c.instance_id, 0) + 1
+                iid_parts = ", ".join(
+                    f"{iid or '<local>'}:{n}"
+                    for iid, n in sorted(by_iid.items()))
                 row = sub.row()
                 row.label(
                     text=f"{slot.width_px}×{slot.height_px}, "
                          f"{len(slot.correspondences)} пар")
+                row = sub.row()
+                row.label(text=iid_parts, icon='OUTLINER_COLLECTION')
 
         layout.separator()
         layout.operator("pba_tri.auto_triangulate",
@@ -76,11 +89,15 @@ class PBA_TRI_PT_main(bpy.types.Panel):
                          text="Start New Point", icon='ADD')
         else:
             # Показать текущее состояние слотов
+            row = box.row(align=True)
             for i in range(3):
-                row = box.row()
-                clicked = any(cl.slot == i for cl in p.clicks)
-                icon = 'CHECKMARK' if clicked else 'RADIOBUT_OFF'
-                row.label(text=f"Слот {i + 1}", icon=icon)
+                slot = p.photos[i]
+                if not slot.loaded:
+                    icon = 'REMOVE'
+                else:
+                    clicked = any(cl.slot == i for cl in p.clicks)
+                    icon = 'CHECKMARK' if clicked else 'X'
+                row.label(text="", icon=icon)
 
             row = box.row(align=True)
             row.operator("pba_tri.pick_click", text="Pick Here",
