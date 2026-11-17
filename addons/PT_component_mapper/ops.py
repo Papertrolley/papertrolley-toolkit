@@ -36,11 +36,15 @@ def _set_status(scene, msg):
 
 
 def _ensure_object_mode(context):
-    if context.mode != 'OBJECT':
-        try:
-            bpy.ops.object.mode_set(mode='OBJECT')
-        except Exception:
-            pass
+    """Выйти из Edit Mode, если активен. Возвращает True, если
+    гарантированно Object Mode."""
+    if context.mode == 'OBJECT':
+        return True
+    try:
+        bpy.ops.object.mode_set(mode='OBJECT')
+    except Exception:
+        pass
+    return context.mode == 'OBJECT'
 
 
 def _list_uv_maps(scene):
@@ -88,6 +92,7 @@ def _ensure_local_uuids(obj):
             name=PBA_VERTEX_ID_ATTR, type='INT', domain='POINT')
         for i in range(len(me.vertices)):
             attr.data[i].value = i + 1
+        me.update()
         return
     max_id = 0
     for i in range(len(attr.data)):
@@ -104,13 +109,7 @@ def _ensure_local_uuids(obj):
         attr.data[i].value = next_id
         seen.add(next_id)
         next_id += 1
-
-
-def _get_vertex_uuid(mesh, vi):
-    attr = mesh.attributes.get(PBA_VERTEX_ID_ATTR)
-    if attr is None or vi < 0 or vi >= len(attr.data):
-        return 0
-    return int(attr.data[vi].value)
+    me.update()
 
 
 def _compute_meters_per_uv(scene, uv_map_name):
@@ -122,8 +121,9 @@ def _compute_meters_per_uv(scene, uv_map_name):
         uv_layer = me.uv_layers.get(uv_map_name)
         if uv_layer is None or len(uv_layer.data) == 0:
             continue
+        M = obj.matrix_world
         for poly in me.polygons:
-            verts = [me.vertices[me.loops[li].vertex_index].co
+            verts = [M @ me.vertices[me.loops[li].vertex_index].co
                      for li in poly.loop_indices]
             uvs = [uv_layer.data[li].uv for li in poly.loop_indices]
             for i in range(1, len(verts) - 1):
@@ -219,22 +219,21 @@ def _build_uv_edge_counts(mesh, uv_map_name):
 
 
 def _find_sidecar_json(comp_dir, uv_map_name):
-    """Ищет pieces/*.json по полю uv_map."""
+    """Ищет pieces/*.json по полю uv_map (плоская структура)."""
     pieces_dir = os.path.join(comp_dir, "pieces")
     if not os.path.isdir(pieces_dir):
         return None, None
-    for root, _dirs, files in os.walk(pieces_dir):
-        for f in files:
-            if not f.endswith(".json"):
-                continue
-            path = os.path.join(root, f)
-            try:
-                with open(path, 'r', encoding='utf-8') as fp:
-                    data = json.load(fp)
-            except Exception:
-                continue
-            if data.get("uv_map") == uv_map_name:
-                return path, data
+    for f in os.listdir(pieces_dir):
+        if not f.endswith(".json"):
+            continue
+        path = os.path.join(pieces_dir, f)
+        try:
+            with open(path, 'r', encoding='utf-8') as fp:
+                data = json.load(fp)
+        except Exception:
+            continue
+        if data.get("uv_map") == uv_map_name:
+            return path, data
     return None, None
 
 
@@ -447,7 +446,10 @@ class PBA_CM_OT_save_piece(bpy.types.Operator, ExportHelper):
     def execute(self, context):
         scene = context.scene
         pba = scene.pba_cm
-        _ensure_object_mode(context)
+        if not _ensure_object_mode(context):
+            self.report({'ERROR'},
+                        "Не удалось выйти из Edit Mode — выйдите вручную")
+            return {'CANCELLED'}
 
         # === СИНХРОНИЗАЦИЯ: сначала .blend, потом экспорт ===
         if not bpy.data.filepath:
@@ -455,14 +457,16 @@ class PBA_CM_OT_save_piece(bpy.types.Operator, ExportHelper):
                         "Файл не сохранён. Используйте Load Component.")
             return {'CANCELLED'}
 
-        comp_dir = os.path.dirname(bpy.data.filepath)
         if (pba.loaded_component_path
                 and bpy.path.abspath(pba.loaded_component_path)
                     != bpy.data.filepath):
-            print(f"[PBA CM] ВНИМАНИЕ: текущий .blend "
-                  f"({bpy.data.filepath}) не совпадает с "
-                  f"loaded_component_path "
-                  f"({pba.loaded_component_path}). Сохраняем текущий.")
+            self.report(
+                {'ERROR'},
+                f"Текущий .blend ({os.path.basename(bpy.data.filepath)}) "
+                f"не совпадает с loaded_component_path "
+                f"({os.path.basename(pba.loaded_component_path)}). "
+                f"Откройте компонент через Load Component.")
+            return {'CANCELLED'}
 
         try:
             bpy.ops.wm.save_mainfile()
@@ -513,13 +517,45 @@ class PBA_CM_OT_save_piece(bpy.types.Operator, ExportHelper):
                         f"Ни у одного объекта нет UV '{uv_map}'")
             return {'CANCELLED'}
 
-        # 1. Обеспечить UUID на всех meshes
+        # 1. Обеспечить UUID на всех meshes + валидация
         for obj in scene.objects:
             if obj.type != 'MESH':
                 continue
             if obj.data.uv_layers.get(uv_map) is None:
                 continue
             _ensure_local_uuids(obj)
+
+        uuid_problems = []
+        for obj in scene.objects:
+            if obj.type != 'MESH':
+                continue
+            if obj.data.uv_layers.get(uv_map) is None:
+                continue
+            attr = obj.data.attributes.get(PBA_VERTEX_ID_ATTR)
+            if attr is None:
+                uuid_problems.append(f"{obj.name}: атрибут не создан")
+                continue
+            seen = set()
+            for i in range(len(attr.data)):
+                v = int(attr.data[i].value)
+                if v <= 0:
+                    uuid_problems.append(
+                        f"{obj.name}[v{i}]: uuid={v}")
+                    break
+                if v in seen:
+                    uuid_problems.append(
+                        f"{obj.name}[v{i}]: дубликат uuid={v}")
+                    break
+                seen.add(v)
+
+        if uuid_problems:
+            for p in uuid_problems[:10]:
+                print(f"[PBA CM] UUID: {p}")
+            self.report(
+                {'ERROR'},
+                f"UUID невалидны ({len(uuid_problems)} проблем, "
+                f"см. консоль). Сохранение отменено.")
+            return {'CANCELLED'}
 
         mpu = _compute_meters_per_uv(scene, uv_map)
         if mpu is None:
@@ -728,6 +764,23 @@ class PBA_CM_OT_save_component(bpy.types.Operator):
                         "или File → Save As.")
             return {'CANCELLED'}
 
+        if not _ensure_object_mode(context):
+            self.report({'ERROR'},
+                        "Не удалось выйти из Edit Mode — выйдите вручную")
+            return {'CANCELLED'}
+
+        # Ensure UUIDs для всех mesh с любым UV-слоем (общая гигиена)
+        touched = 0
+        for obj in scene.objects:
+            if obj.type != 'MESH':
+                continue
+            if len(obj.data.uv_layers) == 0:
+                continue
+            _ensure_local_uuids(obj)
+            touched += 1
+        if touched:
+            print(f"[PBA CM] UUID ensured на {touched} объектах")
+
         try:
             bpy.ops.wm.save_mainfile()
         except Exception as e:
@@ -823,8 +876,17 @@ class PBA_CM_OT_validate_uv_layers(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
         mesh_objs = [o for o in scene.objects if o.type == 'MESH']
-        if len(mesh_objs) < 2:
-            _set_status(scene, "Меньше 2 объектов")
+
+        if not mesh_objs:
+            _set_status(scene, "В сцене нет mesh-объектов")
+            return {'FINISHED'}
+
+        if len(mesh_objs) == 1:
+            obj = mesh_objs[0]
+            names = sorted(l.name for l in obj.data.uv_layers)
+            _set_status(
+                scene,
+                f"OK: 1 объект ({obj.name}), UV-слои: {names or 'нет'}")
             return {'FINISHED'}
 
         per_obj = {o.name: set(l.name for l in o.data.uv_layers)
