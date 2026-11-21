@@ -8,7 +8,7 @@ class PBA_CM_PT_main(bpy.types.Panel):
     bl_idname = "PT_CM_PT_main"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "PT Mapper"
+    bl_category = "PT Component"
 
     def draw(self, context):
         layout = self.layout

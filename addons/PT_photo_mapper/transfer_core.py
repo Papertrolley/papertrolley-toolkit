@@ -42,6 +42,77 @@ def _obj_world_vertices(obj):
     return (co_local @ M[:3, :3].T) + M[:3, 3]
 
 
+def _obj_world_vertices_evaluated(obj, depsgraph):
+    """Возвращает (verts_world Nx3, tris Kx3) с учётом модификаторов.
+    None, None — если объект пуст или не удалось вычислить."""
+    try:
+        obj_eval = obj.evaluated_get(depsgraph)
+    except Exception:
+        return None, None
+    me = obj_eval.to_mesh()
+    if me is None or len(me.vertices) == 0:
+        if me is not None:
+            obj_eval.to_mesh_clear()
+        return None, None
+    try:
+        M = np.array(obj_eval.matrix_world)
+        co_local = np.empty(len(me.vertices) * 3, dtype=np.float64)
+        me.vertices.foreach_get("co", co_local)
+        co_local = co_local.reshape(-1, 3)
+        verts_world = (co_local @ M[:3, :3].T) + M[:3, 3]
+        me.calc_loop_triangles()
+        tris = np.empty(len(me.loop_triangles) * 3, dtype=np.int64)
+        me.loop_triangles.foreach_get("vertices", tris)
+        tris = tris.reshape(-1, 3)
+    finally:
+        obj_eval.to_mesh_clear()
+    return verts_world, tris
+
+
+def _build_depth_buffer(scene, P, W, H, depsgraph=None, sub=2):
+    """Depth buffer с sub×sub субсэмплингом. Возвращает
+    (depth_min, depth_max) размера (H, W): минимальная и максимальная
+    z по субсэмплам пикселя. Для точки z:
+        z <  depth_min·(1+eps)  → видима
+        z >  depth_max·(1−eps)  → перекрыта
+        иначе                   → граничная зона
+    """
+    if depsgraph is None:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    W_i = int(W)
+    H_i = int(H)
+    sub_W = W_i * sub
+    sub_H = H_i * sub
+    depth = np.full((sub_H, sub_W), np.inf, dtype=np.float32)
+
+    for obj in scene.objects:
+        if obj.type != 'MESH':
+            continue
+        verts_world, tris = _obj_world_vertices_evaluated(obj, depsgraph)
+        if verts_world is None or len(tris) == 0:
+            continue
+
+        u, v, w = _project_points(P, verts_world)
+        u_s = u * sub
+        v_s = v * sub
+
+        for tri in tris:
+            v0, v1, v2 = int(tri[0]), int(tri[1]), int(tri[2])
+            if w[v0] <= 0 or w[v1] <= 0 or w[v2] <= 0:
+                continue
+            _rasterize_depth(
+                u_s[v0], v_s[v0], w[v0],
+                u_s[v1], v_s[v1], w[v1],
+                u_s[v2], v_s[v2], w[v2],
+                sub_W, sub_H, depth)
+
+    # Down-sample: min и max по sub×sub блоку
+    d_blocks = depth.reshape(H_i, sub, W_i, sub)
+    depth_min = d_blocks.min(axis=(1, 3))
+    depth_max = d_blocks.max(axis=(1, 3))
+    return depth_min, depth_max
+
+
 def _find_object(instance_id, obj_name):
     if instance_id:
         coll = bpy.data.collections.get(f"Instance_{instance_id}")
@@ -69,34 +140,6 @@ def _compute_homography(src, dst):
     H = Vt[-1].reshape(3, 3)
     n = np.linalg.norm(H)
     return H / n if n > 1e-12 else None
-
-
-def _build_depth_buffer(scene, P, W, H):
-    W_i = int(W)
-    H_i = int(H)
-    depth = np.full((H_i, W_i), np.inf, dtype=np.float32)
-
-    for obj in scene.objects:
-        if obj.type != 'MESH':
-            continue
-        me = obj.data
-        if len(me.vertices) == 0:
-            continue
-
-        verts_world = _obj_world_vertices(obj)
-        u, v, w = _project_points(P, verts_world)
-        me.calc_loop_triangles()
-
-        for lt in me.loop_triangles:
-            v0, v1, v2 = lt.vertices
-            if w[v0] <= 0 or w[v1] <= 0 or w[v2] <= 0:
-                continue
-            _rasterize_depth(
-                u[v0], v[v0], w[v0],
-                u[v1], v[v1], w[v1],
-                u[v2], v[v2], w[v2],
-                W_i, H_i, depth)
-    return depth
 
 
 def _rasterize_depth(u0, v0, z0, u1, v1, z1, u2, v2, z2, W, H, depth):
@@ -132,7 +175,7 @@ def _rasterize_depth(u0, v0, z0, u1, v1, z1, u2, v2, z2, W, H, depth):
 
 
 def _rasterize_colored(p0, p1, p2, xyz, P, W_photo, H_photo,
-                        pixels, depth, output, W_out, H_out):
+                        pixels, depth_min, depth_max, output, W_out, H_out):
     xs = (p0[0], p1[0], p2[0])
     ys = (p0[1], p1[1], p2[1])
     x_min = max(0, int(np.floor(min(xs))))
@@ -174,10 +217,23 @@ def _rasterize_colored(p0, p1, p2, xyz, P, W_photo, H_photo,
 
     us = np.clip(u_px.astype(np.int64), 0, int(W_photo) - 1)
     vs = np.clip(v_px.astype(np.int64), 0, int(H_photo) - 1)
-    scene_z = depth[vs, us]
-    finite = np.isfinite(scene_z)
-    not_occ = np.where(finite, wv < scene_z * 1.05, True)
-    valid = valid & not_occ
+    z_min = depth_min[vs, us]
+    z_max = depth_max[vs, us]
+
+    finite_min = np.isfinite(z_min)
+    finite_max = np.isfinite(z_max)
+
+    # Три зоны:
+    #   z < min*1.02  — точно видима (ближе любой поверхности)
+    #   z > max*0.98  — точно перекрыта (дальше любой поверхности)
+    #   между         — граница: считаем видимой (мягкая проверка),
+    #                   позднее можно заменить на ray cast (Вариант C)
+    definitely_visible = ~finite_min | (wv < z_min * 1.02)
+    definitely_hidden = finite_max & (wv > z_max * 0.98)
+    uncertain_visible = ~(definitely_visible | definitely_hidden)
+
+    visible = definitely_visible | uncertain_visible
+    valid = valid & visible
 
     if not valid.any():
         return
@@ -244,7 +300,7 @@ def process_photo(scene, layout, image, camera_obj, out_dir,
 
     if verbose:
         print(f"  depth buffer {int(W_photo)}×{int(H_photo)}...")
-    depth = _build_depth_buffer(scene, P, W_photo, H_photo)
+    depth_min, depth_max = _build_depth_buffer(scene, P, W_photo, H_photo)
 
     output = np.zeros((H_out, W_out, 4), dtype=np.uint8)
     stats = {
@@ -334,9 +390,9 @@ def process_photo(scene, layout, image, camera_obj, out_dir,
 
             xyz = verts_world[[v0, v1, v2]]
             _rasterize_colored(
-                layout_pts[0], layout_pts[1], layout_pts[2],
-                xyz, P, W_photo, H_photo, pixels, depth,
-                output, W_out, H_out)
+                    layout_pts[0], layout_pts[1], layout_pts[2],
+                    xyz, P, W_photo, H_photo, pixels, depth_min, depth_max,
+                    output, W_out, H_out)
             touched = True
 
         if touched:

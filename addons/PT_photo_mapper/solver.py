@@ -285,3 +285,121 @@ def pose_refine_multistart(world_pts, pixel_pts, W, H, f_px, M_init,
               f"rmse от {min(results):.3f} до {max(results):.3f}")
 
     return best_M, best_rmse, best_k1, best_k2
+
+
+def _residuals_pose_crop(params, world_pts, pixel_pts, W, H, f_px,
+                          use_k1=False, use_k2=False):
+    """params: [rx, ry, rz, tx, ty, tz, off_x, off_y] + опц. [k1, k2].
+
+    Модель: observed = f_px * x_n * fac(k1, k2) + (cx, cy) + (off_x, off_y).
+    off_x/y — в пикселях фото, знак "на сколько сдвинуть base-проекцию,
+    чтобы попасть в observation"."""
+    R_wc = _rodrigues(params[0:3])
+    t_wc = params[3:6]
+    off_x = params[6]
+    off_y = params[7]
+    use_dist = use_k1 or use_k2
+    k1 = params[8] if use_dist else 0.0
+    k2 = params[9] if use_dist else 0.0
+    cx, cy = W / 2.0, H / 2.0
+    res = np.zeros(2 * len(world_pts))
+    for i, (X, xp) in enumerate(zip(world_pts, pixel_pts)):
+        Xc = R_wc @ np.asarray(X) + t_wc
+        if Xc[2] <= 1e-9:
+            res[2 * i] = 1e6
+            res[2 * i + 1] = 1e6
+            continue
+        xn = Xc[0] / Xc[2]
+        yn = Xc[1] / Xc[2]
+        fac = 1.0
+        if use_k1:
+            r2 = xn * xn + yn * yn
+            fac += k1 * r2
+        if use_k2:
+            r2 = xn * xn + yn * yn
+            fac += k2 * r2 * r2
+        u = f_px * xn * fac + cx + off_x
+        v = f_px * yn * fac + cy + off_y
+        res[2 * i] = u - xp[0]
+        res[2 * i + 1] = v - xp[1]
+        if abs(k1) > 0.15:
+            res = res + 1e4 * np.sign(res)
+        if abs(k2) > 0.05:
+            res = res + 1e4 * np.sign(res)
+    return res
+
+
+def pose_refine_with_crop(world_pts, pixel_pts, W, H, f_px, M_init,
+                           off_init=(0.0, 0.0),
+                           use_k1=False, use_k2=False,
+                           huber_delta=0.0, max_iter=200):
+    """Совместное решение pose (6) + crop offset (2) + опц. дисторсия (2).
+
+    Возвращает (M, rmse, k1, k2, off_x, off_y)."""
+    p0 = _params_from_matrix(M_init)
+    t_scale = max(float(np.linalg.norm(p0[3:6])), 0.1)
+    off_scale = max(float(W), float(H)) * 0.1
+    n_extra = 2 if (use_k1 or use_k2) else 0
+    n_params = 8 + n_extra
+
+    def unscale(ps):
+        out = [ps[0], ps[1], ps[2],
+               ps[3] * t_scale, ps[4] * t_scale, ps[5] * t_scale,
+               ps[6] * off_scale, ps[7] * off_scale]
+        if n_extra:
+            out.extend([ps[8], ps[9]])
+        return np.array(out)
+
+    def cost(ps):
+        return _residuals_pose_crop(unscale(ps), world_pts, pixel_pts,
+                                     W, H, f_px,
+                                     use_k1=use_k1, use_k2=use_k2)
+
+    params0 = [p0[0], p0[1], p0[2],
+               p0[3] / t_scale, p0[4] / t_scale, p0[5] / t_scale,
+               float(off_init[0]) / off_scale,
+               float(off_init[1]) / off_scale]
+    if n_extra:
+        params0.extend([0.0, 0.0])
+    params0 = np.array(params0)
+
+    final, _, err = _lm_solve(cost, params0, n_params,
+                               max_iter=max_iter, huber_delta=huber_delta)
+
+    un = unscale(final)
+    M = _matrix_from_pose(un[0:6])
+    off_x = float(un[6])
+    off_y = float(un[7])
+    k1 = float(un[8]) if n_extra else 0.0
+    k2 = float(un[9]) if n_extra else 0.0
+    rmse = float(np.sqrt(err / len(world_pts)))
+    return M, rmse, k1, k2, off_x, off_y
+
+
+def pose_refine_multistart_with_crop(world_pts, pixel_pts, W, H, f_px, M_init,
+                                      use_distortion_k1=False,
+                                      use_distortion_k2=False,
+                                      huber_delta=0.0, off_init=(0.0, 0.0),
+                                      verbose=False):
+    """Мультистарт: на каждом candidate совместно решаем pose + offset.
+
+    Сигнатура и возвращаемое значение совместимы с прежней версией —
+    вызов из solve_camera не меняется."""
+    candidates = _make_candidates(M_init)
+    best = None
+    rmses = []
+    for M_c in candidates:
+        M_r, rmse, k1, k2, off_x, off_y = pose_refine_with_crop(
+            world_pts, pixel_pts, W, H, f_px, M_c,
+            off_init=off_init,
+            use_k1=use_distortion_k1, use_k2=use_distortion_k2,
+            huber_delta=huber_delta)
+        rmses.append(rmse)
+        if best is None or rmse < best[1]:
+            best = (M_r, rmse, k1, k2, off_x, off_y)
+
+    if verbose:
+        print(f"[PBA crop] {len(candidates)} запусков, "
+              f"rmse {min(rmses):.3f}…{max(rmses):.3f}, "
+              f"best off=({best[4]:.1f}, {best[5]:.1f})")
+    return best

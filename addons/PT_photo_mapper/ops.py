@@ -29,7 +29,7 @@ from bpy_extras.view3d_utils import location_3d_to_region_2d
 from mathutils import Matrix, Vector
 
 from .exif import camera_params, detect_native_resolution, read_exif, to_float
-from .solver import pose_refine_multistart
+from .solver import pose_refine_multistart, pose_refine_multistart_with_crop
 from . import transfer_core
 
 PBA_VERTEX_ID_ATTR = "pba_vertex_id"
@@ -271,6 +271,15 @@ def _apply_json_data(scene, data, path, W, H, cam_obj):
     pba.crop_offset_x = int(photo_info.get("crop_offset_x", 0))
     pba.crop_offset_y = int(photo_info.get("crop_offset_y", 0))
 
+    base_shift = float(max(W, H))
+    cam_obj.data.sensor_fit = 'AUTO'
+    if pba.crop_offset_x != 0 or pba.crop_offset_y != 0:
+        cam_obj.data.shift_x = -pba.crop_offset_x / base_shift
+        cam_obj.data.shift_y = +pba.crop_offset_y / base_shift
+    else:
+        cam_obj.data.shift_x = 0.0
+        cam_obj.data.shift_y = 0.0
+
     if render_lens > 0:
         cam_obj.data.lens = render_lens
     elif physical_lens > 0:
@@ -293,8 +302,8 @@ def _apply_json_data(scene, data, path, W, H, cam_obj):
     pba.last_f_px = float(solve.get("f_px", 0.0))
     pba.last_k1 = float(solve.get("k1", 0.0))
     pba.last_k2 = float(solve.get("k2", 0.0))
-    pba.use_distortion = bool(solve.get("use_distortion", False))
-    pba.use_k2 = bool(solve.get("use_k2", False))
+    pba.use_distortion_k1 = bool(solve.get("use_distortion_k1", False))
+    pba.use_distortion_k2 = bool(solve.get("use_distortion_k2", False))
     pba.huber_delta = float(solve.get("huber_delta", 0.0))
 
     restored = 0
@@ -518,11 +527,6 @@ class PBA_VM_OT_load_photo(bpy.types.Operator):
         scene.render.resolution_y = img.size[1]
         scene.render.resolution_percentage = 100
 
-        focal, sensor = camera_params(path)
-
-        focal = focal if focal else DEFAULT_LENS_MM
-        sensor = sensor if sensor else DEFAULT_SENSOR_MM
-
         pos_key = scene.pba_vm.camera_position
         if pos_key not in _POSITIONS:
             pos_key = "FRONT"
@@ -544,6 +548,8 @@ class PBA_VM_OT_load_photo(bpy.types.Operator):
         # Очищаем всё от старого фото
         _delete_old_camera(scene)
         pba.correspondences.clear()
+        pba.crop_offset_x = 0
+        pba.crop_offset_y = 0
 
         cam_data = bpy.data.cameras.new(name=CAMERA_NAME)
         cam_data.lens = render_lens
@@ -560,13 +566,12 @@ class PBA_VM_OT_load_photo(bpy.types.Operator):
         #   - shift_y в системе co.y (Y растёт вверх);
         #   - shift_x в экранной системе (X совпадает с пиксельной).
         # Двойная инверсия по Y даёт один знак, одинарная по X — другой.
-        if pba.crop_offset_x != 0 or pba.crop_offset_y != 0:
-            cam_obj.data.sensor_fit = "HORIZONTAL"
-            cam_obj.data.shift_x = -pba.crop_offset_x / W_actual
-            cam_obj.data.shift_y = +pba.crop_offset_y / W_actual
-        else:
-            cam_obj.data.shift_x = 0.0
-            cam_obj.data.shift_y = 0.0
+        # offset сброшен в 0 до создания камеры; восстановится
+        # из JSON в _apply_json_data. sensor_fit — AUTO (дефолт),
+        # чтобы одинаково работать для portrait и landscape.
+        cam_obj.data.sensor_fit = 'AUTO'
+        cam_obj.data.shift_x = 0.0
+        cam_obj.data.shift_y = 0.0
 
         try:
             bg = cam_data.background_images.new()
@@ -956,6 +961,42 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
             self.report({"ERROR"}, "Размер фото неизвестен")
             return {"CANCELLED"}
 
+        # Если включён Manual Camera — пересчитать физические и
+        # рендерные параметры из ТЕКУЩИХ manual-настроек UX,
+        # независимо от того, что было при Load Photo.
+        # Это нужно, потому что пользователь может менять
+        # manual_* после Load, и Solve должен это учитывать.
+        if pba.use_manual_camera:
+            physical = (pba.manual_focal_length
+                        if pba.manual_focal_length > 0
+                        else pba.physical_lens_mm)
+            sensor_mm = (pba.manual_sensor_width
+                            if pba.manual_sensor_width > 0
+                            else cam.data.sensor_width)
+
+            if (pba.manual_native_width > 0
+                    and pba.manual_native_height > 0):
+                nw = pba.manual_native_width
+                nh = pba.manual_native_height
+            else:
+                nw = pba.native_width_px or W
+                nh = pba.native_height_px or H
+
+            if physical > 0 and sensor_mm > 0:
+                max_native = max(nw, nh)
+                max_loaded = max(W, H)
+                render_lens = physical * max_native / max_loaded
+                cam.data.lens = render_lens
+                cam.data.sensor_width = sensor_mm
+                cam.data.sensor_fit = 'AUTO'
+                pba.physical_lens_mm = physical
+                print(
+                    f"[PBA solve] manual: "
+                    f"focal={physical:.2f}мм, "
+                    f"sensor={sensor_mm:.2f}мм, "
+                    f"native={nw}×{nh}, "
+                    f"render_lens={render_lens:.2f}мм")
+
         lens = cam.data.lens
         sensor = cam.data.sensor_width
 
@@ -980,54 +1021,77 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
             print(f"[PBA VM] синхронизировано {n} 3D-координат")
 
         world_pts = [np.array(c.x3d) for c in corrs]
-        off_x = pba.crop_offset_x
-        off_y = pba.crop_offset_y
-        if off_x != 0 or off_y != 0:
-            print(f"[PBA solve] Применяю crop offset: ({off_x}, {off_y}) px")
-        pixel_pts = [np.array(c.x2d) - np.array([off_x, off_y]) for c in corrs]
-
+        world_pts = [np.array(c.x3d) for c in corrs]
         M_init = np.array(cam.matrix_world)
+        M_best = None
 
-        print(
-            f"[PBA solve] focal={lens:.2f}mm, sensor={sensor:.2f}mm, "
-            f"точек={len(world_pts)}, "
-            f"дисторсия={'K1+K2' if pba.use_distortion_k1 and pba.use_distortion_k2 else 'K1' if pba.use_distortion_k1 else 'K2' if pba.use_distortion_k2 else 'выкл'}, "
-            f"crop={crop:.3f}"
-        )
-        print(f"[PBA solve] base_f_px = {base_f_px:.1f}")
+        if pba.use_auto_crop:
+            if len(corrs) < 8:
+                self.report(
+                    {'WARNING'},
+                    f"Auto-crop: {len(corrs)} пар, рекомендуется ≥8 — "
+                    f"поза и offset могут быть плохо разделимы")
+            print(f"[PBA solve] AUTO-CROP: init_off="
+                  f"({pba.crop_offset_x}, {pba.crop_offset_y})")
 
-        best = None
+            M_best, rmse, k1, k2, off_x_f, off_y_f = \
+                pose_refine_multistart_with_crop(
+                    world_pts,
+                    [np.array(c.x2d) for c in corrs],
+                    W, H, base_f_px, M_init,
+                    use_distortion_k1=pba.use_distortion_k1,
+                    use_distortion_k2=pba.use_distortion_k2,
+                    huber_delta=pba.huber_delta,
+                    off_init=(float(pba.crop_offset_x),
+                              float(pba.crop_offset_y)),
+                    verbose=True)
 
-        M_best, rmse, k1, k2 = pose_refine_multistart(
-            world_pts,
-            pixel_pts,
-            W,
-            H,
-            base_f_px,
-            M_init,
-            use_distortion_k1=pba.use_distortion_k1,
-            use_distortion_k2=pba.use_distortion_k2,
-            huber_delta=pba.huber_delta,
-            verbose=False,
-        )
+            off_x = int(round(off_x_f))
+            off_y = int(round(off_y_f))
+            pba.crop_offset_x = off_x
+            pba.crop_offset_y = off_y
 
-        if best is None or rmse < best[1]:
-            best = (M_best, rmse, k1, k2)
+            # Санити-чек: смещение больше картинки — почти наверняка
+            # вырожденный кейс (плоская сцена, <8 точек и т.п.)
+            if abs(off_x) > W or abs(off_y) > H:
+                print(f"[PBA solve] ВНИМАНИЕ: crop offset "
+                      f"({off_x}, {off_y}) больше размера фото "
+                      f"({W}×{H}) — вероятно, дегенеративное решение")
+                self.report(
+                    {'WARNING'},
+                    f"Auto-crop дал подозрительный offset "
+                    f"({off_x}, {off_y}) — добавьте точек на разных "
+                    f"гранях или отключите Auto-crop")
+        else:
+            off_x = pba.crop_offset_x
+            off_y = pba.crop_offset_y
+            if off_x != 0 or off_y != 0:
+                print(f"[PBA solve] Применяю crop offset: "
+                      f"({off_x}, {off_y}) px")
+            pixel_pts = [np.array(c.x2d) - np.array([off_x, off_y])
+                         for c in corrs]
 
-        if best is None:
-            self.report({"ERROR"}, "LM не сошёлся")
-            return {"CANCELLED"}
-
-        M_best, rmse, k1, k2 = best
-        print(f"[PBA solve] ПОЛУЧЕНО:rmse={rmse:.3f}, k1={k1:+.4f}, k2={k2:+.4f}")
+            M_best, rmse, k1, k2 = pose_refine_multistart(
+                world_pts, pixel_pts, W, H, base_f_px, M_init,
+                use_distortion_k1=pba.use_distortion_k1,
+                use_distortion_k2=pba.use_distortion_k2,
+                huber_delta=pba.huber_delta, verbose=False)
 
         cam.matrix_world = Matrix(M_best.tolist())
-        # Синхронизировать shift камеры с текущим offset
-        # См. комментарий в PBA_VM_OT_load_photo про разные знаки X/Y.
+        # Синхронизировать shift камеры с offset.
+        # База shift — сторона, к которой привязан sensor_width_mm:
+        #   AUTO       → max(W, H)  (стандарт Blender)
+        #   HORIZONTAL → W
+        #   VERTICAL   → H
         if off_x != 0 or off_y != 0:
-            cam.data.sensor_fit = "HORIZONTAL"
-            cam.data.shift_x = -off_x / W
-            cam.data.shift_y = +off_y / W
+            if cam.data.sensor_fit == 'AUTO':
+                base_shift = float(max(W, H))
+            elif cam.data.sensor_fit == 'HORIZONTAL':
+                base_shift = float(W)
+            else:
+                base_shift = float(H)
+            cam.data.shift_x = -off_x / base_shift
+            cam.data.shift_y = +off_y / base_shift
         else:
             cam.data.shift_x = 0.0
             cam.data.shift_y = 0.0
@@ -1093,120 +1157,6 @@ classes += (
     PBA_VM_OT_clear_pairs,
     PBA_VM_OT_solve_camera,
 )
-
-
-class PBA_VM_OT_remove_outliers(bpy.types.Operator):
-    bl_idname = "pba_vm.remove_outliers"
-    bl_label = "Remove Outliers"
-    bl_description = "Удалить пары с ошибкой > 2.5 × медианы"
-
-    def execute(self, context):
-        scene = context.scene
-        pba = scene.pba_vm
-
-        if not pba.correspondences:
-            self.report({"WARNING"}, "Нет пар")
-            return {"CANCELLED"}
-
-        bpy.ops.pba_vm.diagnose_pairs()
-
-        errs = [c.last_error for c in pba.correspondences if c.last_error >= 0.0]
-        if not errs:
-            return {"CANCELLED"}
-
-        errs_sorted = sorted(errs)
-        median = errs_sorted[len(errs_sorted) // 2]
-        threshold = max(median * 2.5, 5.0)
-
-        to_remove = [
-            i for i, c in enumerate(pba.correspondences) if c.last_error > threshold
-        ]
-
-        for i in reversed(to_remove):
-            pba.correspondences.remove(i)
-
-        _set_status(
-            scene,
-            f"Удалено: {len(to_remove)} (порог {threshold:.1f}px, "
-            f"медиана {median:.1f}px). Осталось {len(pba.correspondences)} пар.",
-        )
-
-        # Автоматически пересчитать решение, если хватает пар
-        if len(pba.correspondences) >= 6:
-            bpy.ops.pba_vm.solve_camera()
-        else:
-            _set_status(
-                scene,
-                f"Удалено: {len(to_remove)}. Осталось "
-                f"{len(pba.correspondences)} пар — нужно ≥6 для решения.",
-            )
-
-        return {"FINISHED"}
-
-
-classes += (
-    PBA_VM_OT_remove_outliers,
-)
-
-
-class PBA_VM_OT_plot_residuals(bpy.types.Operator):
-    bl_idname = "pba_vm.plot_residuals"
-    bl_label = "Plot Residuals"
-    bl_description = (
-        "Показать на фото векторы ошибок: измеренная точка → проекция из текущей камеры"
-    )
-
-    def execute(self, context):
-        scene = context.scene
-        cam = scene.camera
-        if cam is None or cam.type != "CAMERA":
-            self.report({"ERROR"}, "Нет активной камеры")
-            return {"CANCELLED"}
-
-        W, H = _get_photo_size(scene)
-        if W == 0 or H == 0:
-            self.report({"ERROR"}, "Размер фото неизвестен")
-            return {"CANCELLED"}
-
-        from PIL import Image, ImageDraw
-
-        path = bpy.path.abspath(scene.pba_vm.photo_path)
-        img = Image.open(path).convert("RGB")
-        draw = ImageDraw.Draw(img)
-
-        # Начало координат фото, отмеченное крестиком — для контроля
-        # совпадения системы координат.
-        cx, cy = W / 2.0, H / 2.0
-        draw.line([(cx - 20, cy), (cx + 20, cy)], fill=(0, 255, 0), width=2)
-        draw.line([(cx, cy - 20), (cx, cy + 20)], fill=(0, 255, 0), width=2)
-
-        for i, c in enumerate(scene.pba_vm.correspondences):
-            co = world_to_camera_view(
-                scene, cam, Vector((c.x3d[0], c.x3d[1], c.x3d[2]))
-            )
-            px = co.x * W
-            py = (1.0 - co.y) * H
-            mx, my = c.x2d[0], c.x2d[1]
-
-            # измеренная точка — синий крестик
-            draw.line([(mx - 6, my), (mx + 6, my)], fill=(0, 128, 255), width=3)
-            draw.line([(mx, my - 6), (mx, my + 6)], fill=(0, 128, 255), width=3)
-
-            # вектор ошибки — красная стрелка от измеренной к проекции
-            draw.line([(mx, my), (px, py)], fill=(255, 0, 0), width=2)
-            # проекция — красный кружок
-            draw.ellipse((px - 4, py - 4, px + 4, py + 4), fill=(255, 0, 0))
-
-            draw.text((mx + 8, my + 8), f"{i}:{c.last_error:.0f}", fill=(255, 255, 0))
-
-        out = os.path.splitext(path)[0] + ".residuals.png"
-        img.save(out)
-        _set_status(scene, f"Остатки сохранены: {out}")
-        self.report({"INFO"}, f"Residuals: {out}")
-        return {"FINISHED"}
-
-
-classes += (PBA_VM_OT_plot_residuals,)
 
 
 def _get_selected_vertex_indices(context):

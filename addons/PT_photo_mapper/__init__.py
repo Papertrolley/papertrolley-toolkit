@@ -86,6 +86,8 @@ class PBA_VM_Props(bpy.types.PropertyGroup):
     native_height_px: bpy.props.IntProperty(default=0)
     native_source: bpy.props.StringProperty(default="")
     physical_lens_mm: bpy.props.FloatProperty(default=50.0)
+    use_auto_crop: bpy.props.BoolProperty(name="Auto-detect Crop",
+        default=False, description="Определять crop offset автоматически при Solve")
     crop_offset_x: bpy.props.IntProperty(default=0)
     crop_offset_y: bpy.props.IntProperty(default=0)
 

@@ -16,11 +16,11 @@ import bpy
 
 
 class PBA_VM_PT_main(bpy.types.Panel):
-    bl_label = "PT Photo"
+    bl_label = "PT Photo Mapper"
     bl_idname = "PT_PM_PT_main"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "PT Mapper"
+    bl_category = "PT Photo"
 
     def draw(self, context):
         layout = self.layout
@@ -56,12 +56,17 @@ class PBA_VM_PT_main(bpy.types.Panel):
 
             box = layout.box()
             box.label(text="Crop Offset", icon='FULLSCREEN_EXIT')
+            box.prop(pba, "use_auto_crop", text="Auto-detect at Solve")
             row = box.row(align=True)
+            row.enabled = not pba.use_auto_crop
             row.prop(pba, "crop_offset_x", text="X")
             row.prop(pba, "crop_offset_y", text="Y")
-            hint = box.row()
-            hint.label(text="Подбор: начни с 0, смотри на визуальный "
-                            "сдвиг модели", icon='INFO')
+            if pba.use_auto_crop:
+                box.label(text="Значения обновятся при Solve",
+                          icon='INFO')
+            else:
+                box.label(text="Ручная настройка: начни с 0, смотри на визуальный сдвиг модели",
+                          icon='HAND')
 
         col = layout.column(align=True)
         col.operator("pba_vm.load_photo", icon='CAMERA_DATA')
@@ -120,7 +125,6 @@ class PBA_VM_PT_main(bpy.types.Panel):
         # Управление
         row = box.row(align=True)
         row.operator("pba_vm.solve_camera", text="Solve", icon='CAMERA_DATA')
-        row.operator("pba_vm.remove_outliers", text="Outliers", icon='FILTER')
 
         row = box.row(align=True)
         box.prop(pba, "use_distortion_k1")
