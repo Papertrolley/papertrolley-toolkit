@@ -83,7 +83,6 @@ class PBA_VM_PT_main(bpy.types.Panel):
         row.label(text="2D: " + ("✓" if pba.pending_2d_set else "—"))
 
         col = box.column(align=True)
-        col.operator("pba_vm.pick_3d", icon='VERTEXSEL')
         col.operator("pba_vm.pick_2d", icon='MOUSE_LMB')
 
         if pba.correspondences:

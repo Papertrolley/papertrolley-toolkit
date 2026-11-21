@@ -787,12 +787,12 @@ def _commit_pair(scene):
     pba.pending_3d_uuid = 0
 
 
-class PBA_VM_OT_pick_3d(bpy.types.Operator):
-    bl_idname = "pba_vm.pick_3d"
-    bl_label = "Pick 3D Vertex"
-    bl_description = "Запомнить выделенную вершину (Edit Mode, ровно одна)"
+class PBA_VM_OT_pick_2d(bpy.types.Operator):
+    bl_idname = "pba_vm.pick_2d"
+    bl_label = "3D selection → Pick 2D"
+    bl_description = "Кликните на точку соответствия на фотографии (Numpad 0)"
 
-    def execute(self, context):
+    def _pick3D(self, context):
         scene = context.scene
         obj = context.active_object
         if obj is None or obj.type != 'MESH':
@@ -802,7 +802,6 @@ class PBA_VM_OT_pick_3d(bpy.types.Operator):
             self.report({'ERROR'}, "Нужен Edit Mode")
             return {'CANCELLED'}
 
-        import bmesh
         bm = bmesh.from_edit_mesh(obj.data)
         bm.verts.ensure_lookup_table()
         selected = [v for v in bm.verts if v.select]
@@ -818,7 +817,7 @@ class PBA_VM_OT_pick_3d(bpy.types.Operator):
         iid, orig_name, local_uuid = _get_component_key(obj, v.index)
         if local_uuid == 0:
             print(f"[PBA VM] ВНИМАНИЕ: у вершины {obj.name} "
-                  f"v{v.index} нет UUID. Вершина не привязана к компоненту.")
+                    f"v{v.index} нет UUID. Вершина не привязана к компоненту.")
             self.report({'ERROR'},
                         "У вершины нет UUID. Сохраните компонент "
                         "через Component Mapper или назначьте UUID.")
@@ -835,15 +834,17 @@ class PBA_VM_OT_pick_3d(bpy.types.Operator):
             scene,
             f"3D: {iid_str}/{orig_name}/uuid={local_uuid} = "
             f"({p_world.x:.2f}, {p_world.y:.2f}, {p_world.z:.2f})")
-        return {'FINISHED'}
-
-
-class PBA_VM_OT_pick_2d(bpy.types.Operator):
-    bl_idname = "pba_vm.pick_2d"
-    bl_label = "Pick 2D on Photo"
-    bl_description = "Кликните точку на фотографии (Numpad 0)"
+        return {"FINISHED"}
 
     def invoke(self, context, event):
+        # Pick3D
+        result = self._pick3D(context)
+        if result is None:
+            self.report({"ERROR"}, "Pick3D упал.")
+            return {"CANCELLED"}
+        if "FINISHED" not in result:
+            return result
+
         self._invoke_area = context.area
         self._invoke_region = context.region
         scene = context.scene
@@ -1151,7 +1152,6 @@ class PBA_VM_OT_solve_camera(bpy.types.Operator):
 
 
 classes += (
-    PBA_VM_OT_pick_3d,
     PBA_VM_OT_pick_2d,
     PBA_VM_OT_remove_pair,
     PBA_VM_OT_clear_pairs,
