@@ -3,6 +3,9 @@ import json
 import os
 from mathutils import Vector
 import time as _pba_time
+import re
+
+_SUFFIX_RE = re.compile(r'\.\d{3,}$')
 
 PBA_VERTEX_ID_ATTR = "pba_vertex_id"
 PBA_INSTANCE_ID_PROP = "pba_instance_id"
@@ -48,6 +51,13 @@ def _set_status(scene, msg):
 
 
 # ====================== Утилиты ======================
+
+def _strip_blender_suffix(name):
+    """Убрать .001-суффикс, который Blender добавляет при коллизии имён
+    в bpy.data.libraries.load. Имена в библиотеке не должны содержать
+    суффиксов — они ломают композитный ключ pba_original_name."""
+    return _SUFFIX_RE.sub('', name)
+
 
 def _ensure_object_mode(context):
     if context.mode != 'OBJECT':
@@ -276,7 +286,7 @@ def _instantiate_component(scene, iid, cid, comp_path,
     offset = target_loc - orig_anchor
 
     for obj in mesh_objects:
-        orig_name = obj.name
+        orig_name = _strip_blender_suffix(obj.name)
         new_name = f"{iid}__{orig_name}"
         obj.name = new_name
         if obj.data is not None:
@@ -420,7 +430,7 @@ def _reload_instance(scene, inst):
 
     new_coll_for_fp = bpy.data.collections.get(new_coll_name)
     inst.mesh_fingerprint = _instance_fingerprint(new_coll_for_fp)
-    _pba_last_fp_check = 0.0
+    _reset_fp_throttle()
     return True, None, warnings
 
 
@@ -464,6 +474,14 @@ def _resume_dirty_mark():
 
 _pba_last_fp_check = 0.0
 _PBA_FP_THROTTLE = 0.4  # сек
+
+
+def _reset_fp_throttle():
+    """Сбросить throttle, чтобы следующий тик fingerprint-проверки
+    сработал немедленно. global обязателен — без него в вызывающей
+    функции создаётся локальная переменная, и глобал не обновляется."""
+    global _pba_last_fp_check
+    _pba_last_fp_check = 0.0
 
 
 def _on_depsgraph_update(scene, depsgraph):
@@ -531,20 +549,79 @@ def _tag_redraw_viewports():
 
 
 def _instance_fingerprint(coll):
-    """Хэш от позиций вершин всех mesh-объектов коллекции."""
+    """Хэш геометрии, UV и топологии всех mesh-объектов коллекции.
+    Использует numpy + foreach_get для скорости на больших мешах.
+    Включает:
+      - позиции вершин,
+      - количество рёбер / граней и размеры полигонов,
+      - индексы вершин в петлях (детектирует переиндексацию),
+      - UV-координаты всех слоёв.
+    """
     import hashlib
+    try:
+        import numpy as np
+    except ImportError:
+        # fallback для окружений без numpy — медленный цикл
+        h = hashlib.sha1()
+        if coll is None:
+            return ""
+        for obj in sorted(coll.objects, key=lambda o: o.name):
+            if obj.type != 'MESH' or obj.data is None:
+                continue
+            me = obj.data
+            h.update(obj.name.encode('utf-8'))
+            h.update(str(len(me.vertices)).encode('utf-8'))
+            for v in me.vertices:
+                co = v.co
+                h.update(f"|{co.x:.5f},{co.y:.5f},{co.z:.5f}".encode('utf-8'))
+            h.update(f"|P{len(me.polygons)}E{len(me.edges)}".encode('utf-8'))
+            for uv_layer in me.uv_layers:
+                h.update(f"|UV:{uv_layer.name}".encode('utf-8'))
+                for li in range(len(uv_layer.data)):
+                    uv = uv_layer.data[li].uv
+                    h.update(f"|{uv.x:.5f},{uv.y:.5f}".encode('utf-8'))
+        return h.hexdigest()[:16]
+
     h = hashlib.sha1()
     if coll is None:
         return ""
     for obj in sorted(coll.objects, key=lambda o: o.name):
         if obj.type != 'MESH' or obj.data is None:
             continue
-        h.update(obj.name.encode('utf-8'))
         me = obj.data
-        h.update(str(len(me.vertices)).encode('utf-8'))
-        for v in me.vertices:
-            co = v.co
-            h.update(f"|{co.x:.5f},{co.y:.5f},{co.z:.5f}".encode('utf-8'))
+        h.update(obj.name.encode('utf-8'))
+
+        # Вершины
+        n_verts = len(me.vertices)
+        h.update(f"|V{n_verts}".encode('utf-8'))
+        if n_verts:
+            co = np.empty(n_verts * 3, dtype=np.float32)
+            me.vertices.foreach_get("co", co)
+            h.update(co.tobytes())
+
+        # Топология: грани, рёбра, размеры полигонов, индексы в петлях
+        n_polys = len(me.polygons)
+        n_edges = len(me.edges)
+        h.update(f"|P{n_polys}E{n_edges}".encode('utf-8'))
+        if n_polys:
+            loop_total = np.empty(n_polys, dtype=np.int32)
+            me.polygons.foreach_get("loop_total", loop_total)
+            h.update(loop_total.tobytes())
+        n_loops = len(me.loops)
+        if n_loops:
+            loop_verts = np.empty(n_loops, dtype=np.int32)
+            me.loops.foreach_get("vertex_index", loop_verts)
+            h.update(loop_verts.tobytes())
+
+        # UV-слои
+        for uv_layer in me.uv_layers:
+            h.update(f"|UV:{uv_layer.name}".encode('utf-8'))
+            n_uvs = len(uv_layer.data)
+            if n_uvs:
+                uv_arr = np.empty(n_uvs * 2, dtype=np.float32)
+                uv_layer.data.foreach_get("uv", uv_arr)
+                h.update(uv_arr.tobytes())
+
     return h.hexdigest()[:16]
 
 
@@ -580,7 +657,7 @@ def _on_load_post(*args):
         if coll is None:
             continue
         fp = _instance_fingerprint(coll)
-        if fp and not inst.mesh_fingerprint:
+        if fp:
             inst.mesh_fingerprint = fp
 
 
@@ -799,7 +876,7 @@ class PBA_AM_OT_import_component(bpy.types.Operator):
                 scene, iid, cid, comp_path, target_loc, (0, 0, 0))
         finally:
             _resume_dirty_mark()
-            _pba_last_fp_check = 0.0
+            _reset_fp_throttle()
         if err:
             self.report({'ERROR'}, err)
             return {'CANCELLED'}
@@ -1000,6 +1077,8 @@ class PBA_AM_OT_load_assembly(bpy.types.Operator):
             self.report({'ERROR'}, f"Ошибка чтения: {e}")
             return {'CANCELLED'}
 
+        warnings = []
+
         _suppress_dirty_mark()
         try:
             for inst in list(pba.instances):
@@ -1023,9 +1102,17 @@ class PBA_AM_OT_load_assembly(bpy.types.Operator):
                 inst.component_path = comp_path
                 inst.position = tuple(float(x) for x in pos[:3])
                 inst.rotation = tuple(float(x) for x in rot[:3])
+
+                # mtime: из JSON как fallback, актуализируется ниже
                 inst.component_mtime = float(cd.get("component_mtime", 0.0))
-                inst.has_local_changes = bool(cd.get("has_local_changes", False))
-                inst.mesh_fingerprint = cd.get("mesh_fingerprint", "")
+
+                # Load Assembly загружает меш с диска — любые unpub
+                # изменения из старой сцены отброшены. has_local_changes
+                # сбрасываем, но если в JSON был True — предупреждаем.
+                json_had_local_changes = bool(
+                    cd.get("has_local_changes", False))
+                inst.has_local_changes = False
+                inst.mesh_fingerprint = ""
 
                 if not comp_path or not os.path.isdir(comp_path):
                     failed.append(f"{iid}: папка не найдена: {comp_path}")
@@ -1038,9 +1125,24 @@ class PBA_AM_OT_load_assembly(bpy.types.Operator):
                     continue
 
                 inst.collection_name = coll_name
+
+                # Актуализировать mtime по файлу на диске (иначе Validator
+                # даст ложный warning «library newer»)
+                mesh_path = os.path.join(comp_path, MESH_FILE_NAME)
+                try:
+                    inst.component_mtime = float(os.path.getmtime(mesh_path))
+                except Exception:
+                    pass  # оставить значение из JSON
+
                 if coll_name:
                     inst.mesh_fingerprint = _instance_fingerprint(
                         bpy.data.collections.get(coll_name))
+
+                if json_had_local_changes:
+                    warnings.append(
+                        f"{iid}: неопубликованные изменения из JSON "
+                        f"отброшены (загружена актуальная библиотека)")
+
                 succeeded += 1
         finally:
             _resume_dirty_mark()
@@ -1053,6 +1155,10 @@ class PBA_AM_OT_load_assembly(bpy.types.Operator):
             msg += f", ошибок: {len(failed)}"
             for e in failed:
                 print(f"[PBA AM] ОШИБКА: {e}")
+        if warnings:
+            msg += f", предупреждений: {len(warnings)}"
+            for w in warnings:
+                print(f"[PBA AM] {w}")
         _set_status(scene, msg)
         self.report({'INFO'}, msg)
         return {'FINISHED'}
@@ -1179,11 +1285,13 @@ class PBA_AM_OT_reload_component(bpy.types.Operator):
             ok, err, warnings = _reload_instance(scene, inst)
         finally:
             _resume_dirty_mark()
-            inst.has_local_changes = False
         if not ok:
             _set_status(scene, f"Reload '{iid}': {err}")
             self.report({'ERROR'}, f"{iid}: {err}")
             return {'CANCELLED'}
+
+        # Только при успехе считаем, что instance синхронизирован с библиотекой
+        inst.has_local_changes = False
 
         # Снять выделение
         for obj in context.view_layer.objects:
@@ -1438,7 +1546,7 @@ class PBA_AM_OT_publish_instance(bpy.types.Operator):
             _cleanup_publish_temp(temp_coll)
         finally:
             _resume_dirty_mark()
-            _pba_last_fp_check = 0.0
+            _reset_fp_throttle()
         # после write, до отчёта:
         inst.has_local_changes = False
         inst.mesh_fingerprint = _instance_fingerprint(coll)
