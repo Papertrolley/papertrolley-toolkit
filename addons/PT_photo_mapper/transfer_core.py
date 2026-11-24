@@ -405,3 +405,236 @@ def process_photo(scene, layout, image, camera_obj, out_dir,
     out_path = os.path.join(out_dir, basename + ".png")
     Image.fromarray(output, "RGBA").save(out_path, "PNG")
     return out_path, stats
+
+
+def _process_photo_core(layout, pixels, W_photo, H_photo,
+                        matrix_world_flat, f_px, off_x, off_y,
+                        scene, out_path, verbose=False):
+    """Общее ядро: принимает всё примитивами, не зависит от
+    bpy.types.Image или bpy.types.Object. Используется и интерактивным
+    transfer (Photo Mapper), и CLI (transfer_blender.py).
+    """
+    M = np.array(matrix_world_flat, dtype=np.float64).reshape(4, 4)
+    M_cv = np.diag([1.0, -1.0, -1.0, 1.0]) @ np.linalg.inv(M)
+    K = np.array([
+        [f_px, 0.0, W_photo / 2.0 + off_x],
+        [0.0, f_px, H_photo / 2.0 + off_y],
+        [0.0, 0.0, 1.0],
+    ])
+    P = K @ M_cv[:3, :]
+
+    page = layout.get("page", {})
+    W_out = int(page.get("width_px", 4960))
+    H_out = int(page.get("height_px", 7016))
+
+    if pixels.dtype != np.float32:
+        pixels = pixels.astype(np.float32)
+
+    if verbose:
+        print(f"  depth buffer {int(W_photo)}×{int(H_photo)}...")
+    depth_min, depth_max = _build_depth_buffer(scene, P, W_photo, H_photo)
+
+    output = np.zeros((H_out, W_out, 4), dtype=np.uint8)
+    stats = {
+        "ok": 0, "bad_corners": 0, "no_object": 0,
+        "no_uv_layer": 0, "no_attr": 0, "no_vertices": 0,
+        "bad_homography": 0, "no_triangles": 0,
+    }
+
+    for isl in layout.get("islands", []):
+        instance_id = isl.get("instance_id", "")
+        obj_name = isl.get("obj_name", "")
+        uv_map = isl.get("uv_map", "")
+        corners_uv = isl.get("corners_uv", [])
+        corners_layout = isl.get("corners_layout_px", [])
+        vertices_data = isl.get("vertices", [])
+
+        if len(corners_uv) != 4 or len(corners_layout) != 4:
+            stats["bad_corners"] += 1
+            continue
+
+        obj = _find_object(instance_id, obj_name)
+        if obj is None:
+            stats["no_object"] += 1
+            if verbose and stats["no_object"] == 1:
+                print(f"  [DEBUG] island '{isl.get('island_id')}': "
+                      f"объект не найден "
+                      f"(instance='{instance_id}', obj='{obj_name}')")
+            continue
+
+        uv_layer = obj.data.uv_layers.get(uv_map) if uv_map else None
+        if uv_layer is None:
+            stats["no_uv_layer"] += 1
+            if verbose and stats["no_uv_layer"] == 1:
+                print(f"  [DEBUG] island '{isl.get('island_id')}': "
+                      f"нет UV '{uv_map}' у {obj.name}. "
+                      f"Есть: {[l.name for l in obj.data.uv_layers]}")
+            continue
+
+        attr = obj.data.attributes.get(PBA_VERTEX_ID_ATTR)
+        if attr is None:
+            stats["no_attr"] += 1
+            continue
+
+        uuid_to_idx = {}
+        for i in range(len(attr.data)):
+            uuid_to_idx[int(attr.data[i].value)] = i
+
+        vert_indices = set()
+        for vd in vertices_data:
+            uuid_val = int(vd.get("local_uuid", 0))
+            if uuid_val in uuid_to_idx:
+                vert_indices.add(uuid_to_idx[uuid_val])
+        if not vert_indices:
+            stats["no_vertices"] += 1
+            continue
+
+        H_hom = _compute_homography(corners_uv, corners_layout)
+        if H_hom is None:
+            stats["bad_homography"] += 1
+            continue
+
+        uv_min_u = min(c[0] for c in corners_uv)
+        uv_max_u = max(c[0] for c in corners_uv)
+        uv_min_v = min(c[1] for c in corners_uv)
+        uv_max_v = max(c[1] for c in corners_uv)
+
+        verts_world = _obj_world_vertices(obj)
+        me = obj.data
+        me.calc_loop_triangles()
+
+        touched = False
+        for lt in me.loop_triangles:
+            v0, v1, v2 = lt.vertices
+            if (v0 not in vert_indices
+                    or v1 not in vert_indices
+                    or v2 not in vert_indices):
+                continue
+
+            layout_pts = []
+            uv_in_bbox = True
+            for li in lt.loops:
+                uv = uv_layer.data[li].uv
+                if not (uv_min_u - 1e-6 <= uv.x <= uv_max_u + 1e-6
+                        and uv_min_v - 1e-6 <= uv.y <= uv_max_v + 1e-6):
+                    uv_in_bbox = False
+                    break
+                h = H_hom @ np.array([uv.x, uv.y, 1.0])
+                if abs(h[2]) < 1e-12:
+                    uv_in_bbox = False
+                    break
+                layout_pts.append((h[0] / h[2], h[1] / h[2]))
+
+            if not uv_in_bbox:
+                continue
+
+            xyz = verts_world[[v0, v1, v2]]
+            _rasterize_colored(
+                layout_pts[0], layout_pts[1], layout_pts[2],
+                xyz, P, W_photo, H_photo, pixels, depth_min, depth_max,
+                output, W_out, H_out)
+            touched = True
+
+        if touched:
+            stats["ok"] += 1
+        else:
+            stats["no_triangles"] += 1
+
+    Image.fromarray(output, "RGBA").save(out_path, "PNG")
+    return stats
+
+
+def process_photo(scene, layout, image, camera_obj, out_dir,
+                  f_px, off_x, off_y, verbose=False):
+    """Интерактивный transfer: Image + Object из сцены."""
+    W_photo = float(image.size[0])
+    H_photo = float(image.size[1])
+    if W_photo == 0 or H_photo == 0:
+        raise RuntimeError("Изображение пустое")
+
+    photo_path = bpy.path.abspath(image.filepath)
+    try:
+        pil_img = Image.open(photo_path).convert("RGB")
+        pixels = np.array(pil_img, dtype=np.float32)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось прочитать фото: {e}")
+
+    os.makedirs(out_dir, exist_ok=True)
+    basename = os.path.splitext(os.path.basename(photo_path))[0]
+    out_path = os.path.join(out_dir, basename + ".png")
+
+    matrix_flat = [float(camera_obj.matrix_world[i][j])
+                   for i in range(4) for j in range(4)]
+    stats = _process_photo_core(
+        layout, pixels, W_photo, H_photo, matrix_flat,
+        f_px, off_x, off_y, scene, out_path, verbose=verbose)
+    return out_path, stats
+
+
+def process_photo_from_meta(scene, layout, photo_path, meta_path,
+                             out_dir, verbose=False):
+    """CLI-обёртка: всё читается из файлов (фото + *.vertices.json).
+    Используется в transfer_blender.py для batch-обработки."""
+    import json as _json
+
+    W_photo, H_photo, matrix_flat, f_px, off_x, off_y = \
+        _parse_meta(meta_path)
+
+    try:
+        pil_img = Image.open(photo_path).convert("RGB")
+        pixels = np.array(pil_img, dtype=np.float32)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось прочитать фото: {e}")
+
+    # Если размеры в meta не совпадают с фактическими — доверяем meta
+    # (meta содержит правильные W/H, в т.ч. с учётом кропа).
+    if pixels.shape[0] != int(H_photo) or pixels.shape[1] != int(W_photo):
+        # Часто бывает, что meta снята с другого разрешения — предупреждаем
+        print(f"  ВНИМАНИЕ: meta W×H={int(W_photo)}×{int(H_photo)}, "
+              f"файл {pixels.shape[1]}×{pixels.shape[0]}. "
+              f"Использую meta.")
+
+    os.makedirs(out_dir, exist_ok=True)
+    basename = os.path.splitext(os.path.basename(photo_path))[0]
+    out_path = os.path.join(out_dir, basename + ".png")
+
+    stats = _process_photo_core(
+        layout, pixels, W_photo, H_photo, matrix_flat,
+        f_px, off_x, off_y, scene, out_path, verbose=verbose)
+    return out_path, stats
+
+
+def _parse_meta(meta_path):
+    """Читает *.vertices.json, возвращает примитивы для ядра."""
+    import json as _json
+    with open(meta_path, 'r', encoding='utf-8') as f:
+        meta = _json.load(f)
+
+    cam = meta["camera"]
+    matrix_flat = cam["matrix_world"]
+    if len(matrix_flat) != 16:
+        raise ValueError(
+            f"matrix_world в {meta_path}: {len(matrix_flat)} чисел, "
+            f"нужно 16")
+
+    photo = meta["photo"]
+    W = float(photo["width_px"])
+    H = float(photo["height_px"])
+    nw = float(photo.get("native_width_px", W))
+    nh = float(photo.get("native_height_px", H))
+    off_x = float(photo.get("crop_offset_x", 0))
+    off_y = float(photo.get("crop_offset_y", 0))
+
+    solve = meta.get("solve", {})
+    f_px = float(solve.get("f_px", 0.0))
+    if f_px <= 0:
+        lens = float(cam.get("lens_mm", 50.0))
+        sensor = float(cam.get("sensor_width_mm", 36.0))
+        # sensor_width_mm соответствует длинной стороне сенсора
+        # (sensor_fit='AUTO' в Blender). Для portrait max(nw, nh) = nh.
+        f_px = lens / sensor * max(nw, nh)
+        print(f"  f_px=0 в meta, fallback: {f_px:.1f} "
+              f"(lens={lens}, sensor={sensor}, "
+              f"native={int(nw)}×{int(nh)})")
+
+    return W, H, matrix_flat, f_px, off_x, off_y
