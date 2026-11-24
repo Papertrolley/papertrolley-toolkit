@@ -24,6 +24,7 @@ class PBA_AM_Instance(bpy.types.PropertyGroup):
     collection_name: bpy.props.StringProperty()
     position: bpy.props.FloatVectorProperty(size=3, default=(0.0, 0.0, 0.0))
     rotation: bpy.props.FloatVectorProperty(size=3, default=(0.0, 0.0, 0.0))
+    scale: bpy.props.FloatVectorProperty(size=3, default=(1.0, 1.0, 1.0))
     component_mtime: bpy.props.FloatProperty(
         name="Component mtime", default=0.0,
         description="mtime mesh.blend на момент импорта. 0.0 = не задан (старые сборки)")
@@ -258,7 +259,7 @@ def _delete_collection_and_objects(coll_name):
 
 
 def _instantiate_component(scene, iid, cid, comp_path,
-                            target_loc, target_rot):
+                            target_loc, target_rot, target_scale=None):
     mesh_path = os.path.join(comp_path, MESH_FILE_NAME)
     if not os.path.exists(mesh_path):
         return None, f"нет {MESH_FILE_NAME} в {comp_path}"
@@ -306,6 +307,8 @@ def _instantiate_component(scene, iid, cid, comp_path,
         if obj.parent is None:
             obj.location = obj.location + offset
             obj.rotation_euler = target_rot
+            if target_scale is not None:
+                obj.scale = target_scale
 
     for obj in new_objects:
         if obj.type != 'MESH':
@@ -386,6 +389,7 @@ def _reload_instance(scene, inst):
     # Запоминаем позицию, UUID и место в иерархии до удаления
     position = list(inst.position)
     rotation = list(inst.rotation)
+    scale = list(inst.scale)
     coll = bpy.data.collections.get(coll_name)
     old_uuids = _collect_uuid_sets(coll)
     saved_parent, saved_index = _find_collection_parent_and_index(scene, coll)
@@ -394,6 +398,7 @@ def _reload_instance(scene, inst):
         if first is not None:
             position = list(first.location)
             rotation = list(first.rotation_euler)
+            scale = list(first.scale)
 
     siblings = [
         x.instance_id for x in scene.pba_am.instances
@@ -407,7 +412,7 @@ def _reload_instance(scene, inst):
     _delete_collection_and_objects(coll_name)
 
     new_coll_name, err = _instantiate_component(
-        scene, iid, cid, comp_path, position, rotation)
+        scene, iid, cid, comp_path, position, rotation, scale)
     if err:
         return False, err, []
 
@@ -423,6 +428,7 @@ def _reload_instance(scene, inst):
     inst.collection_name = new_coll_name
     inst.position = tuple(position)
     inst.rotation = tuple(rotation)
+    inst.scale = tuple(scale)
     try:
         inst.component_mtime = float(os.path.getmtime(mesh_path))
     except Exception:
@@ -715,10 +721,23 @@ class PBA_AM_OT_create_component(bpy.types.Operator):
             self.report({'ERROR'}, "Запустите из 3D Viewport")
             return {'CANCELLED'}
 
-        cid = pba.component_id.strip()
-        if not cid:
+        cid_raw = pba.component_id.strip()
+        if not cid_raw:
             self.report({'ERROR'}, "Укажите Component ID")
             return {'CANCELLED'}
+        cid = re.sub(r'[^A-Za-z0-9._-]', '_', cid_raw)
+        if cid in ('.', '..') or not cid:
+            self.report(
+                {'ERROR'},
+                f"Недопустимый Component ID: {cid_raw!r}")
+            return {'CANCELLED'}
+        if cid != cid_raw:
+            print(f"[PBA AM] Component ID sanitized: "
+                  f"{cid_raw!r} → {cid!r}")
+            _set_status(
+                scene,
+                f"Component ID: {cid_raw!r} → {cid!r} "
+                f"(запрещённые символы заменены на '_')")
         cdir = bpy.path.abspath(pba.components_dir)
         if not cdir:
             self.report({'ERROR'}, "Укажите Components Dir")
@@ -754,6 +773,7 @@ class PBA_AM_OT_create_component(bpy.types.Operator):
             return {'CANCELLED'}
         target_loc = top_objs[0].location.copy()
         target_rot = tuple(top_objs[0].rotation_euler)
+        target_scale = tuple(top_objs[0].scale)
 
         for obj in objs:
             if obj.modifiers:
@@ -790,7 +810,7 @@ class PBA_AM_OT_create_component(bpy.types.Operator):
 
         # 3. Импорт из библиотеки на месте исходного выделения
         coll_name, err = _instantiate_component(
-            scene, iid, cid, comp_path, target_loc, target_rot)
+            scene, iid, cid, comp_path, target_loc, target_rot, target_scale)
         if err:
             self.report(
                 {'ERROR'},
@@ -807,6 +827,7 @@ class PBA_AM_OT_create_component(bpy.types.Operator):
         inst.collection_name = coll_name
         inst.position = tuple(target_loc)
         inst.rotation = tuple(target_rot)
+        inst.scale = tuple(target_scale)
         try:
             inst.component_mtime = float(os.path.getmtime(mesh_path))
         except Exception:
@@ -816,7 +837,7 @@ class PBA_AM_OT_create_component(bpy.types.Operator):
             bpy.data.collections.get(coll_name))
         pba.active_instance_index = len(pba.instances) - 1
 
-        _try_autosave(scene)
+        # _try_autosave(scene) # отключено намеренно
         _set_status(scene, f"Компонент создан и импортирован: {iid}")
         self.report({'INFO'}, f"Компонент создан и импортирован: {iid}")
         return {'FINISHED'}
@@ -888,6 +909,15 @@ class PBA_AM_OT_import_component(bpy.types.Operator):
         inst.collection_name = coll_name
         inst.position = tuple(target_loc)
         inst.rotation = (0.0, 0.0, 0.0)
+        # target_scale не передан → scale из библиотеки сохранён.
+        # Читаем фактическое значение, чтобы inst.scale соответствовал
+        # реальности и пережил Reload/Save-Load без «сплющивания».
+        new_coll = bpy.data.collections.get(coll_name)
+        if new_coll is not None:
+            first = next((o for o in new_coll.objects
+                          if o.parent is None), None)
+            if first is not None:
+                inst.scale = tuple(first.scale)
         inst.has_local_changes = False
         try:
             inst.component_mtime = float(os.path.getmtime(blend_path))
@@ -898,7 +928,7 @@ class PBA_AM_OT_import_component(bpy.types.Operator):
         inst.mesh_fingerprint = _instance_fingerprint(
             bpy.data.collections.get(coll_name))
 
-        _try_autosave(scene)
+        # _try_autosave(scene) # отключено намеренно
         _set_status(scene, f"Импортирован: {iid}")
         return {'FINISHED'}
 
@@ -923,7 +953,7 @@ class PBA_AM_OT_remove_instance(bpy.types.Operator):
         pba.instances.remove(self.index)
         pba.active_instance_index = min(self.index,
                                         len(pba.instances) - 1)
-        _try_autosave(scene)
+        # _try_autosave(scene) # отключено намеренно
         _set_status(scene, f"Удалён: {iid}")
         return {'FINISHED'}
 
@@ -1001,6 +1031,7 @@ class PBA_AM_OT_save_assembly(bpy.types.Operator):
             coll = bpy.data.collections.get(inst.collection_name)
             position = list(inst.position)
             rotation = list(inst.rotation)
+            scale = list(inst.scale)
 
             if coll is not None:
                 instance_objects.update(coll.objects)
@@ -1009,8 +1040,10 @@ class PBA_AM_OT_save_assembly(bpy.types.Operator):
                 if first is not None:
                     position = list(first.location)
                     rotation = list(first.rotation_euler)
+                    scale = list(first.scale)
                     inst.position = tuple(position)
                     inst.rotation = tuple(rotation)
+                    inst.scale = tuple(scale)
 
             components_data.append({
                 "instance_id": inst.instance_id,
@@ -1019,6 +1052,7 @@ class PBA_AM_OT_save_assembly(bpy.types.Operator):
                 "collection_name": inst.collection_name,
                 "position": position,
                 "rotation": rotation,
+                "scale": scale,
                 "component_mtime": float(inst.component_mtime),
                 "has_local_changes": bool(inst.has_local_changes),
                 "mesh_fingerprint": inst.mesh_fingerprint,
@@ -1102,37 +1136,55 @@ class PBA_AM_OT_load_assembly(bpy.types.Operator):
                 inst.component_path = comp_path
                 inst.position = tuple(float(x) for x in pos[:3])
                 inst.rotation = tuple(float(x) for x in rot[:3])
-
-                # mtime: из JSON как fallback, актуализируется ниже
                 inst.component_mtime = float(cd.get("component_mtime", 0.0))
-
-                # Load Assembly загружает меш с диска — любые unpub
-                # изменения из старой сцены отброшены. has_local_changes
-                # сбрасываем, но если в JSON был True — предупреждаем.
                 json_had_local_changes = bool(
                     cd.get("has_local_changes", False))
                 inst.has_local_changes = False
                 inst.mesh_fingerprint = ""
+
+                # scale: если ключ есть (новые JSON) — применяем явно;
+                # если нет (старые JSON) — target_scale=None, чтобы
+                # сохранить масштаб, зашитый в библиотеку. После
+                # инстанцирования прочитаем фактический scale и запишем
+                # в inst.scale (миграция старой сборки в новое поле).
+                scale_raw = cd.get("scale", None)
+                if scale_raw is not None:
+                    inst.scale = tuple(float(x) for x in scale_raw[:3])
+                    target_scale = tuple(inst.scale)
+                else:
+                    inst.scale = (1.0, 1.0, 1.0)
+                    target_scale = None
 
                 if not comp_path or not os.path.isdir(comp_path):
                     failed.append(f"{iid}: папка не найдена: {comp_path}")
                     continue
 
                 coll_name, err = _instantiate_component(
-                    scene, iid, cid, comp_path, pos, rot)
+                    scene, iid, cid, comp_path, pos, rot, target_scale)
                 if err:
                     failed.append(f"{iid}: {err}")
                     continue
 
                 inst.collection_name = coll_name
 
-                # Актуализировать mtime по файлу на диске (иначе Validator
-                # даст ложный warning «library newer»)
+                # Миграция: JSON без ключа scale → читаем фактический
+                # scale из сцены и записываем в inst.scale, чтобы
+                # будущие Reload/Save не «сплющили» компонент.
+                if target_scale is None and coll_name:
+                    new_coll = bpy.data.collections.get(coll_name)
+                    if new_coll is not None:
+                        first = next((o for o in new_coll.objects
+                                      if o.parent is None), None)
+                        if first is not None:
+                            inst.scale = tuple(first.scale)
+
+                # mtime с диска
                 mesh_path = os.path.join(comp_path, MESH_FILE_NAME)
                 try:
-                    inst.component_mtime = float(os.path.getmtime(mesh_path))
+                    inst.component_mtime = float(
+                        os.path.getmtime(mesh_path))
                 except Exception:
-                    pass  # оставить значение из JSON
+                    pass
 
                 if coll_name:
                     inst.mesh_fingerprint = _instance_fingerprint(
@@ -1298,7 +1350,7 @@ class PBA_AM_OT_reload_component(bpy.types.Operator):
             obj.select_set(False)
         context.view_layer.objects.active = None
 
-        _try_autosave(scene)
+        # _try_autosave(scene) # отключено намеренно
 
         if warnings:
             for w in warnings:
@@ -1375,7 +1427,7 @@ class PBA_AM_OT_reload_all(bpy.types.Operator):
 
         _resume_dirty_mark()
 
-        _try_autosave(scene)
+        # _try_autosave(scene) # отключено намеренно
 
         msg = f"Перезагружено: {succeeded}/{total}"
         if failed:
@@ -1551,7 +1603,10 @@ class PBA_AM_OT_publish_instance(bpy.types.Operator):
         inst.has_local_changes = False
         inst.mesh_fingerprint = _instance_fingerprint(coll)
 
-        # 10. Обновить mtime у всех instance этого cid
+        # 10. Обновить mtime ТОЛЬКО у опубликованного instance.
+        # Остальные остаются со старым mtime → панель покажет ERROR
+        # (stale), Validator напомнит о Reload. Решение 1B: никакого
+        # авто-релоада и никакого «сглаживания» staleness у соседей.
         try:
             new_mtime = float(os.path.getmtime(mesh_path))
         except Exception:
@@ -1559,12 +1614,11 @@ class PBA_AM_OT_publish_instance(bpy.types.Operator):
         affected = []
         for other in pba.instances:
             if other.component_id == cid and other.instance_id != iid:
-                other.component_mtime = new_mtime
                 affected.append(other.instance_id)
         inst.component_mtime = new_mtime
 
         # 11. Автосохранение
-        _try_autosave(scene)
+        # _try_autosave(scene) # отключено намеренно
 
         # 12. Отчёт
         msg = f"Опубликован: {iid} → {os.path.basename(mesh_path)}"
