@@ -1,0 +1,367 @@
+{
+  "assembly_id": "liaz-529265-03_2-2-0_sonz",
+  "blend_file": "liaz-529265-03_2-2-0_sonz.blend",
+  "components": [
+    {
+      "instance_id": "cross_section",
+      "component_id": "cross_section",
+      "component_path": "/home/mungojerrie/3D/components/liaz/5292/cross_section",
+      "collection_name": "Instance_cross_section",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1794076032.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "50437c7a26122d9f"
+    },
+    {
+      "instance_id": "back_wheel_liaz5292",
+      "component_id": "back_wheel_liaz5292",
+      "component_path": "/home/mungojerrie/3D/components/wheels/back_wheel_liaz5292",
+      "collection_name": "Instance_back_wheel_liaz5292",
+      "position": [
+        3.4877545833587646,
+        0.0009911460801959038,
+        -0.9699297547340393
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1794125056.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "a4858927562366d3"
+    },
+    {
+      "instance_id": "back_wheel_liaz5292_2",
+      "component_id": "back_wheel_liaz5292",
+      "component_path": "/home/mungojerrie/3D/components/wheels/back_wheel_liaz5292",
+      "collection_name": "Instance_back_wheel_liaz5292_2",
+      "position": [
+        -8.482976913452148,
+        0.0025824476033449173,
+        -0.9694387912750244
+      ],
+      "rotation": [
+        0.0,
+        -0.0,
+        3.1415929794311523
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1794125056.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "de792be01e228704"
+    },
+    {
+      "instance_id": "front_wheel_liaz5292",
+      "component_id": "front_wheel_liaz5292",
+      "component_path": "/home/mungojerrie/3D/components/wheels/front_wheel_liaz5292",
+      "collection_name": "Instance_front_wheel_liaz5292",
+      "position": [
+        3.4208366870880127,
+        1.2759119272232056e-07,
+        -0.9475541710853577
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1794124928.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "098d55abdd6366ca"
+    },
+    {
+      "instance_id": "front_wheel_liaz5292_2",
+      "component_id": "front_wheel_liaz5292",
+      "component_path": "/home/mungojerrie/3D/components/wheels/front_wheel_liaz5292",
+      "collection_name": "Instance_front_wheel_liaz5292_2",
+      "position": [
+        3.4196512699127197,
+        1.2759119272232056e-07,
+        -0.9472025036811829
+      ],
+      "rotation": [
+        0.0,
+        -0.0,
+        3.1415929794311523
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1794124928.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "3cb4a9ca578ff6bb"
+    },
+    {
+      "instance_id": "back_vent_small_rest2",
+      "component_id": "back_vent_small_rest2",
+      "component_path": "/home/mungojerrie/3D/components/liaz/back_vent_small_rest2",
+      "collection_name": "Instance_back_vent_small_rest2",
+      "position": [
+        -3.2269980907440186,
+        0.0752701610326767,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1794124544.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "f20e5c1f83749437"
+    },
+    {
+      "instance_id": "hatch_standard",
+      "component_id": "hatch_standard",
+      "component_path": "/home/mungojerrie/3D/components/liaz/hatch_standard",
+      "collection_name": "Instance_hatch_standard",
+      "position": [
+        5.468513011932373,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1794688512.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "a4f68666a53a1cdd"
+    },
+    {
+      "instance_id": "hatch_standard_2",
+      "component_id": "hatch_standard",
+      "component_path": "/home/mungojerrie/3D/components/liaz/hatch_standard",
+      "collection_name": "Instance_hatch_standard_2",
+      "position": [
+        -0.23022747039794922,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1794688512.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "aba95fdccfe19a96"
+    },
+    {
+      "instance_id": "back_mask_rest2",
+      "component_id": "back_mask_rest2",
+      "component_path": "/home/mungojerrie/3D/components/liaz/5292/back_mask_rest2",
+      "collection_name": "Instance_back_mask_rest2",
+      "position": [
+        -3.060631570406258e-07,
+        1.1887401342391968e-05,
+        -1.4268698578234762e-07
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1795264128.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "0ead3d5290c30c1c"
+    },
+    {
+      "instance_id": "body_529265-03_2-2-0",
+      "component_id": "body_529265-03_2-2-0",
+      "component_path": "/home/mungojerrie/3D/components/liaz/5292/body_529265-03_2-2-0",
+      "collection_name": "Instance_body_529265-03_2-2-0",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1795119360.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "b3b2a7448276399a"
+    },
+    {
+      "instance_id": "sonz_4fans",
+      "component_id": "sonz_4fans",
+      "component_path": "/home/mungojerrie/3D/components/conditioners/sonz_4fans",
+      "collection_name": "Instance_sonz_4fans",
+      "position": [
+        3.8467724323272705,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1795117824.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "29aaed4470699e39"
+    },
+    {
+      "instance_id": "front_mask_msk",
+      "component_id": "front_mask_msk",
+      "component_path": "/home/mungojerrie/3D/components/liaz/5292/front_mask_msk",
+      "collection_name": "Instance_front_mask_msk",
+      "position": [
+        -0.11975252628326416,
+        -1.2366023063659668,
+        0.03807497024536133
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1795421184.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "1e83e3af0c34adab"
+    },
+    {
+      "instance_id": "front_vent_blob",
+      "component_id": "front_vent_blob",
+      "component_path": "/home/mungojerrie/3D/components/liaz/front_vent_blob",
+      "collection_name": "Instance_front_vent_blob",
+      "position": [
+        7.523899555206299,
+        1.20804762840271,
+        0.0024020858108997345
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1795070592.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "9ef1711a55550f31"
+    },
+    {
+      "instance_id": "mirror_left_rest2",
+      "component_id": "mirror_left_rest2",
+      "component_path": "/home/mungojerrie/3D/components/liaz/mirror_left_rest2",
+      "collection_name": "Instance_mirror_left_rest2",
+      "position": [
+        -0.004084371030330658,
+        0.004365026950836182,
+        -0.015056729316711426
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1794124672.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "75d7d8e465669fda"
+    },
+    {
+      "instance_id": "mirror_right_rest2",
+      "component_id": "mirror_right_rest2",
+      "component_path": "/home/mungojerrie/3D/components/liaz/mirror_right_rest2",
+      "collection_name": "Instance_mirror_right_rest2",
+      "position": [
+        0.04539918899536133,
+        0.0043648481369018555,
+        0.032464683055877686
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "component_mtime": 1794124800.0,
+      "has_local_changes": false,
+      "mesh_fingerprint": "00f436c17a6047a8"
+    }
+  ],
+  "local_objects": []
+}
