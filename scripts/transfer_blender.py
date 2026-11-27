@@ -113,6 +113,8 @@ def main():
     ap.add_argument("--out-dir", default="")
     ap.add_argument("--addon-path", default="",
                     help="Папка с transfer_core.py")
+    ap.add_argument("--edge-padding", type=int, default=1,
+                    help="Расширение непрозрачных пикселей на стыках островов (0 = выкл, 1 = один слой, 2 = два)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -161,7 +163,8 @@ def main():
         try:
             out_path, stats = transfer_core.process_photo_from_meta(
                 scene, layout, photo_path, meta_path, out_dir,
-                verbose=args.verbose)
+                verbose=args.verbose,
+                edge_padding=args.edge_padding)
             summary = ", ".join(f"{k}={v}" for k, v in stats.items() if v)
             print(f"  → {os.path.basename(out_path)} ({summary})")
             succeeded += 1

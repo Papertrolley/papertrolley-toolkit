@@ -89,7 +89,7 @@ def _build_depth_buffer(scene, P, W, H, depsgraph=None, sub=2):
         if obj.type != 'MESH':
             continue
         verts_world, tris = _obj_world_vertices_evaluated(obj, depsgraph)
-        if verts_world is None or len(tris) == 0:
+        if verts_world is None or tris is None or len(tris) == 0:
             continue
 
         u, v, w = _project_points(P, verts_world)
@@ -269,147 +269,98 @@ def _rasterize_colored(p0, p1, p2, xyz, P, W_photo, H_photo,
     output[y_final, x_final, 3] = 255
 
 
-def process_photo(scene, layout, image, camera_obj, out_dir,
-                   f_px, off_x, off_y, verbose=False):
-    W_photo = float(image.size[0])
-    H_photo = float(image.size[1])
-    if W_photo == 0 or H_photo == 0:
-        raise RuntimeError("Изображение пустое")
-
-    # Читаем фото через PIL — sRGB-значения, как в файле.
-    photo_path = bpy.path.abspath(image.filepath)
-    try:
-        pil_img = Image.open(photo_path).convert("RGB")
-        pixels = np.array(pil_img, dtype=np.float32)
-    except Exception as e:
-        raise RuntimeError(f"Не удалось прочитать фото: {e}")
-
-    # P-матрица (world → пиксели фото)
-    M_cv = np.diag([1.0, -1.0, -1.0, 1.0]) @ np.linalg.inv(
-        np.array(camera_obj.matrix_world))
-    K = np.array([
-        [f_px, 0.0, W_photo / 2.0 + off_x],
-        [0.0, f_px, H_photo / 2.0 + off_y],
-        [0.0, 0.0, 1.0],
-    ])
-    P = K @ M_cv[:3, :]
-
-    page = layout.get("page", {})
-    W_out = int(page.get("width_px", 4960))
-    H_out = int(page.get("height_px", 7016))
-
-    if verbose:
-        print(f"  depth buffer {int(W_photo)}×{int(H_photo)}...")
-    depth_min, depth_max = _build_depth_buffer(scene, P, W_photo, H_photo)
-
-    output = np.zeros((H_out, W_out, 4), dtype=np.uint8)
-    stats = {
-        "ok": 0, "bad_corners": 0, "no_object": 0,
-        "no_uv_layer": 0, "no_attr": 0, "no_vertices": 0,
-        "bad_homography": 0, "no_triangles": 0,
-    }
-
+def _build_valid_region(layout, W_out, H_out, expand=2):
+    """Union всех corners_layout_px bbox'ов, расширенный на `expand` px.
+    Внутри этой маски разрешено заполнение (dilation); за её пределами —
+    не заполнять. Расширение компенсирует float-округление границ:
+    без него пиксель ровно на границе bbox может не попасть в маску."""
+    mask = np.zeros((H_out, W_out), dtype=bool)
     for isl in layout.get("islands", []):
-        instance_id = isl.get("instance_id", "")
-        obj_name = isl.get("obj_name", "")
-        uv_map = isl.get("uv_map", "")
-        corners_uv = isl.get("corners_uv", [])
-        corners_layout = isl.get("corners_layout_px", [])
-        vertices_data = isl.get("vertices", [])
-
-        if len(corners_uv) != 4 or len(corners_layout) != 4:
-            stats["bad_corners"] += 1
+        corners = isl.get("corners_layout_px", [])
+        if len(corners) < 4:
             continue
+        xs = [c[0] for c in corners]
+        ys = [c[1] for c in corners]
+        x0 = max(0, int(np.floor(min(xs))) - expand)
+        x1 = min(W_out, int(np.ceil(max(xs))) + expand + 1)
+        y0 = max(0, int(np.floor(min(ys))) - expand)
+        y1 = min(H_out, int(np.ceil(max(ys))) + expand + 1)
+        if x1 > x0 and y1 > y0:
+            mask[y0:y1, x0:x1] = True
+    return mask
 
-        obj = _find_object(instance_id, obj_name)
-        if obj is None:
-            stats["no_object"] += 1
-            continue
 
-        uv_layer = obj.data.uv_layers.get(uv_map) if uv_map else None
-        if uv_layer is None:
-            stats["no_uv_layer"] += 1
-            continue
+def _dilate_rgba_padding(output, padding, valid_region=None):
+    """Расширить непрозрачные пиксели на `padding` слоёв (8-связность).
+    Заполняет прозрачные пиксели, граничащие с непрозрачными, усреднённым
+    цветом соседей. Не трогает уже непрозрачные.
 
-        attr = obj.data.attributes.get(PBA_VERTEX_ID_ATTR)
-        if attr is None:
-            stats["no_attr"] += 1
-            continue
+    valid_region: (H, W) bool или None. Если задано, заполняются только
+    пиксели, где valid_region == True. Источниками (opaque neighbors)
+    служат любые непрозрачные пиксели, включая те, что за пределами
+    маски — это позволяет контенту «просачиваться» из существующих
+    непрозрачных областей внутрь маски."""
+    if padding <= 0:
+        return output
+    H, W = output.shape[:2]
+    if valid_region is None:
+        valid_region = np.ones((H, W), dtype=bool)
 
-        uuid_to_idx = {}
-        for i in range(len(attr.data)):
-            uuid_to_idx[int(attr.data[i].value)] = i
+    for _ in range(padding):
+        alpha = output[:, :, 3]
+        opaque = alpha > 0
+        if opaque.all():
+            break
 
-        vert_indices = set()
-        for vd in vertices_data:
-            uuid_val = int(vd.get("local_uuid", 0))
-            if uuid_val in uuid_to_idx:
-                vert_indices.add(uuid_to_idx[uuid_val])
-        if not vert_indices:
-            stats["no_vertices"] += 1
-            continue
+        sum_rgb = np.zeros((H, W, 3), dtype=np.float32)
+        count = np.zeros((H, W), dtype=np.float32)
 
-        H_hom = _compute_homography(corners_uv, corners_layout)
-        if H_hom is None:
-            stats["bad_homography"] += 1
-            continue
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
 
-        uv_min_u = min(c[0] for c in corners_uv)
-        uv_max_u = max(c[0] for c in corners_uv)
-        uv_min_v = min(c[1] for c in corners_uv)
-        uv_max_v = max(c[1] for c in corners_uv)
+                y_src_lo = max(0, -dy)
+                y_src_hi = H - max(0, dy)
+                x_src_lo = max(0, -dx)
+                x_src_hi = W - max(0, dx)
+                y_dst_lo = max(0, dy)
+                y_dst_hi = H - max(0, -dy)
+                x_dst_lo = max(0, dx)
+                x_dst_hi = W - max(0, -dx)
 
-        verts_world = _obj_world_vertices(obj)
-        me = obj.data
-        me.calc_loop_triangles()
+                src_opaque = opaque[y_src_lo:y_src_hi, x_src_lo:x_src_hi]
+                dst_opaque = opaque[y_dst_lo:y_dst_hi, x_dst_lo:x_dst_hi]
 
-        touched = False
-        for lt in me.loop_triangles:
-            v0, v1, v2 = lt.vertices
-            if (v0 not in vert_indices
-                    or v1 not in vert_indices
-                    or v2 not in vert_indices):
-                continue
+                fill = src_opaque & ~dst_opaque
+                if not fill.any():
+                    continue
 
-            layout_pts = []
-            uv_in_bbox = True
-            for li in lt.loops:
-                uv = uv_layer.data[li].uv
-                if not (uv_min_u - 1e-6 <= uv.x <= uv_max_u + 1e-6
-                        and uv_min_v - 1e-6 <= uv.y <= uv_max_v + 1e-6):
-                    uv_in_bbox = False
-                    break
-                h = H_hom @ np.array([uv.x, uv.y, 1.0])
-                if abs(h[2]) < 1e-12:
-                    uv_in_bbox = False
-                    break
-                layout_pts.append((h[0]/h[2], h[1]/h[2]))
+                src_rgb = output[y_src_lo:y_src_hi,
+                                 x_src_lo:x_src_hi, :3]
+                yi, xi = np.nonzero(fill)
+                yi += y_dst_lo
+                xi += x_dst_lo
 
-            if not uv_in_bbox:
-                continue
+                sum_rgb[yi, xi] += src_rgb[fill].astype(np.float32)
+                count[yi, xi] += 1
 
-            xyz = verts_world[[v0, v1, v2]]
-            _rasterize_colored(
-                    layout_pts[0], layout_pts[1], layout_pts[2],
-                    xyz, P, W_photo, H_photo, pixels, depth_min, depth_max,
-                    output, W_out, H_out)
-            touched = True
+        to_fill = (count > 0) & ~opaque & valid_region
+        if not to_fill.any():
+            break
 
-        if touched:
-            stats["ok"] += 1
-        else:
-            stats["no_triangles"] += 1
+        nz = count[to_fill][:, None]
+        output[to_fill, :3] = np.clip(
+            sum_rgb[to_fill] / nz, 0, 255).astype(np.uint8)
+        output[to_fill, 3] = 255
 
-    os.makedirs(out_dir, exist_ok=True)
-    basename = os.path.splitext(os.path.basename(photo_path))[0]
-    out_path = os.path.join(out_dir, basename + ".png")
-    Image.fromarray(output, "RGBA").save(out_path, "PNG")
-    return out_path, stats
+    return output
 
 
 def _process_photo_core(layout, pixels, W_photo, H_photo,
                         matrix_world_flat, f_px, off_x, off_y,
-                        scene, out_path, verbose=False):
+                        scene, out_path, verbose=False,
+                        edge_padding=1):
     """Общее ядро: принимает всё примитивами, не зависит от
     bpy.types.Image или bpy.types.Object. Используется и интерактивным
     transfer (Photo Mapper), и CLI (transfer_blender.py).
@@ -515,8 +466,8 @@ def _process_photo_core(layout, pixels, W_photo, H_photo,
             uv_in_bbox = True
             for li in lt.loops:
                 uv = uv_layer.data[li].uv
-                if not (uv_min_u - 1e-6 <= uv.x <= uv_max_u + 1e-6
-                        and uv_min_v - 1e-6 <= uv.y <= uv_max_v + 1e-6):
+                if not (uv_min_u - 1e-4 <= uv.x <= uv_max_u + 1e-4
+                        and uv_min_v - 1e-4 <= uv.y <= uv_max_v + 1e-4):
                     uv_in_bbox = False
                     break
                 h = H_hom @ np.array([uv.x, uv.y, 1.0])
@@ -540,12 +491,25 @@ def _process_photo_core(layout, pixels, W_photo, H_photo,
         else:
             stats["no_triangles"] += 1
 
+    if edge_padding > 0:
+        valid_region = _build_valid_region(
+            layout, W_out, H_out, expand=2)
+        if verbose:
+            before = int((output[:, :, 3] > 0).sum())
+            _dilate_rgba_padding(output, edge_padding, valid_region=valid_region)
+            after = int((output[:, :, 3] > 0).sum())
+            print(f"  edge padding {edge_padding}px: "
+                  f"+{after - before} px ({before} → {after})")
+        else:
+            _dilate_rgba_padding(output, edge_padding, valid_region=valid_region)
+
     Image.fromarray(output, "RGBA").save(out_path, "PNG")
     return stats
 
 
 def process_photo(scene, layout, image, camera_obj, out_dir,
-                  f_px, off_x, off_y, verbose=False):
+                  f_px, off_x, off_y, verbose=False,
+                  edge_padding=1):
     """Интерактивный transfer: Image + Object из сцены."""
     W_photo = float(image.size[0])
     H_photo = float(image.size[1])
@@ -566,13 +530,15 @@ def process_photo(scene, layout, image, camera_obj, out_dir,
     matrix_flat = [float(camera_obj.matrix_world[i][j])
                    for i in range(4) for j in range(4)]
     stats = _process_photo_core(
-        layout, pixels, W_photo, H_photo, matrix_flat,
-        f_px, off_x, off_y, scene, out_path, verbose=verbose)
+            layout, pixels, W_photo, H_photo, matrix_flat,
+            f_px, off_x, off_y, scene, out_path, verbose=verbose,
+            edge_padding=edge_padding)
     return out_path, stats
 
 
 def process_photo_from_meta(scene, layout, photo_path, meta_path,
-                             out_dir, verbose=False):
+                             out_dir, verbose=False,
+                             edge_padding=1):
     """CLI-обёртка: всё читается из файлов (фото + *.vertices.json).
     Используется в transfer_blender.py для batch-обработки."""
     import json as _json
@@ -600,7 +566,8 @@ def process_photo_from_meta(scene, layout, photo_path, meta_path,
 
     stats = _process_photo_core(
         layout, pixels, W_photo, H_photo, matrix_flat,
-        f_px, off_x, off_y, scene, out_path, verbose=verbose)
+        f_px, off_x, off_y, scene, out_path, verbose=verbose,
+        edge_padding=edge_padding)
     return out_path, stats
 
 
