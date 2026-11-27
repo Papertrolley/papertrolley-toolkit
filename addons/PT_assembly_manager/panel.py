@@ -1,5 +1,6 @@
 import bpy
 import os
+from .ops import _get_inst_mtime
 
 
 class PBA_AM_PT_main(bpy.types.Panel):
@@ -67,14 +68,17 @@ class PBA_AM_PT_main(bpy.types.Panel):
                 row.label(text=f"[{inst.component_id}]")
                 # Индикатор устаревания
                 stale = False
-                if inst.component_mtime > 0 and inst.component_path:
+                inst_mtime = _get_inst_mtime(inst)
+                if inst_mtime > 0 and inst.component_path:
                     mp = os.path.join(inst.component_path, "mesh.blend")
                     if os.path.exists(mp):
                         try:
-                            if os.path.getmtime(mp) > inst.component_mtime + 1.0:
+                            if os.path.getmtime(mp) > inst_mtime + 1.0:
                                 stale = True
                         except Exception:
                             pass
+                if stale:
+                    row.label(text="", icon='ERROR')
                 if stale:
                     row.label(text="", icon='ERROR')
                 if inst.has_local_changes:

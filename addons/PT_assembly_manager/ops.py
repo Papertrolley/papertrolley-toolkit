@@ -25,9 +25,8 @@ class PBA_AM_Instance(bpy.types.PropertyGroup):
     position: bpy.props.FloatVectorProperty(size=3, default=(0.0, 0.0, 0.0))
     rotation: bpy.props.FloatVectorProperty(size=3, default=(0.0, 0.0, 0.0))
     scale: bpy.props.FloatVectorProperty(size=3, default=(1.0, 1.0, 1.0))
-    component_mtime: bpy.props.FloatProperty(
-        name="Component mtime", default=0.0,
-        description="mtime mesh.blend на момент импорта. 0.0 = не задан (старые сборки)")
+    component_mtime_str: bpy.props.StringProperty(default="",
+            description="repr(float) mtime mesh.blend на момент Import/Reload/Publish.")
     has_local_changes: bpy.props.BoolProperty(
         name="Has Local Changes", default=False,
         description="Меш instance изменён после последнего Import/Reload/Publish")
@@ -49,6 +48,28 @@ class PBA_AM_Props(bpy.types.PropertyGroup):
 def _set_status(scene, msg):
     scene.pba_am.status_msg = msg
     print(f"[PBA AM] {msg}")
+
+
+def _get_inst_mtime(inst):
+    """Прочитать mtime из instance. Только из StringProperty (repr(float)).
+    Отсутствие/пустота/невалидное значение → 0.0 («mtime не задан»)."""
+    s = inst.component_mtime_str
+    if not s:
+        return 0.0
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _set_inst_mtime(inst, value):
+    """Записать mtime как repr(float) — 17 значащих цифр, полная
+    точность double, достаточная для любого timestamp."""
+    try:
+        v = float(value)
+    except (ValueError, TypeError):
+        v = 0.0
+    inst.component_mtime_str = repr(v)
 
 
 # ====================== Утилиты ======================
@@ -430,9 +451,9 @@ def _reload_instance(scene, inst):
     inst.rotation = tuple(rotation)
     inst.scale = tuple(scale)
     try:
-        inst.component_mtime = float(os.path.getmtime(mesh_path))
+        _set_inst_mtime(inst, os.path.getmtime(mesh_path))
     except Exception:
-        inst.component_mtime = 0.0
+        _set_inst_mtime(inst, 0.0)
 
     new_coll_for_fp = bpy.data.collections.get(new_coll_name)
     inst.mesh_fingerprint = _instance_fingerprint(new_coll_for_fp)
@@ -829,9 +850,9 @@ class PBA_AM_OT_create_component(bpy.types.Operator):
         inst.rotation = tuple(target_rot)
         inst.scale = tuple(target_scale)
         try:
-            inst.component_mtime = float(os.path.getmtime(mesh_path))
+            _set_inst_mtime(inst, os.path.getmtime(mesh_path))
         except Exception:
-            inst.component_mtime = 0.0
+            _set_inst_mtime(inst, 0.0)
         inst.has_local_changes = False
         inst.mesh_fingerprint = _instance_fingerprint(
             bpy.data.collections.get(coll_name))
@@ -920,9 +941,9 @@ class PBA_AM_OT_import_component(bpy.types.Operator):
                 inst.scale = tuple(first.scale)
         inst.has_local_changes = False
         try:
-            inst.component_mtime = float(os.path.getmtime(blend_path))
+            _set_inst_mtime(inst, os.path.getmtime(blend_path))
         except Exception:
-            inst.component_mtime = 0.0
+            _set_inst_mtime(inst, 0.0)
         pba.active_instance_index = len(pba.instances) - 1
 
         inst.mesh_fingerprint = _instance_fingerprint(
@@ -1053,7 +1074,7 @@ class PBA_AM_OT_save_assembly(bpy.types.Operator):
                 "position": position,
                 "rotation": rotation,
                 "scale": scale,
-                "component_mtime": float(inst.component_mtime),
+                "component_mtime": _get_inst_mtime(inst),
                 "has_local_changes": bool(inst.has_local_changes),
                 "mesh_fingerprint": inst.mesh_fingerprint,
             })
@@ -1136,7 +1157,10 @@ class PBA_AM_OT_load_assembly(bpy.types.Operator):
                 inst.component_path = comp_path
                 inst.position = tuple(float(x) for x in pos[:3])
                 inst.rotation = tuple(float(x) for x in rot[:3])
-                inst.component_mtime = float(cd.get("component_mtime", 0.0))
+                inst.component_mtime_str = ""
+                json_mtime = float(cd.get("component_mtime", 0.0))
+                if json_mtime > 0:
+                    _set_inst_mtime(inst, json_mtime)
                 json_had_local_changes = bool(
                     cd.get("has_local_changes", False))
                 inst.has_local_changes = False
@@ -1181,8 +1205,7 @@ class PBA_AM_OT_load_assembly(bpy.types.Operator):
                 # mtime с диска
                 mesh_path = os.path.join(comp_path, MESH_FILE_NAME)
                 try:
-                    inst.component_mtime = float(
-                        os.path.getmtime(mesh_path))
+                    _set_inst_mtime(inst, os.path.getmtime(mesh_path))
                 except Exception:
                     pass
 
@@ -1250,20 +1273,21 @@ class PBA_AM_OT_validate(bpy.types.Operator):
             else:
                 mesh_path = os.path.join(
                     inst.component_path, MESH_FILE_NAME)
+                inst_mtime = _get_inst_mtime(inst)
                 if not os.path.exists(mesh_path):
                     problems.append(
                         f"{inst.instance_id}: mesh.blend не найден")
-                elif inst.component_mtime <= 0.0:
+                elif inst_mtime <= 0.0:
                     problems.append(
                         f"{inst.instance_id}: mtime не задан "
                         f"(выполните Reload Component)")
                 else:
                     try:
                         current = os.path.getmtime(mesh_path)
-                        if current > inst.component_mtime + 1.0:
+                        if current > inst_mtime + 1.0:
                             problems.append(
                                 f"{inst.instance_id}: библиотека новее "
-                                f"сборки (+{current - inst.component_mtime:.0f}s). "
+                                f"сборки (+{current - inst_mtime:.0f}s). "
                                 f"Используйте Reload Component")
                     except Exception as e:
                         problems.append(
@@ -1615,7 +1639,7 @@ class PBA_AM_OT_publish_instance(bpy.types.Operator):
         for other in pba.instances:
             if other.component_id == cid and other.instance_id != iid:
                 affected.append(other.instance_id)
-        inst.component_mtime = new_mtime
+        _set_inst_mtime(inst, new_mtime)
 
         # 11. Автосохранение
         # _try_autosave(scene) # отключено намеренно
