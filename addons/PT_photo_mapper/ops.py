@@ -31,6 +31,7 @@ from mathutils import Matrix, Vector
 from .exif import camera_params, detect_native_resolution, read_exif, to_float
 from .solver import pose_refine_multistart, pose_refine_multistart_with_crop
 from . import transfer_core
+from . import viz_core
 
 PBA_VERTEX_ID_ATTR = "pba_vertex_id"
 
@@ -1692,4 +1693,104 @@ class PBA_VM_OT_transfer_photo(bpy.types.Operator):
 
 classes += (
     PBA_VM_OT_transfer_photo,
+)
+
+
+class PBA_VM_OT_visualize_transfer(bpy.types.Operator):
+    bl_idname = "pba_vm.visualize_transfer"
+    bl_label = "Visualize Transfer on Model"
+    bl_description = ("Показать только что извлечённые текстуры на "
+                      "3D-модели. Per-object override, не пишет в "
+                      "компоненты, не трогает mesh.data.materials.")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        pba = scene.pba_vm
+
+        layout_path = bpy.path.abspath(pba.layout_path)
+        if not layout_path or not os.path.exists(layout_path):
+            self.report({'ERROR'}, "layout.quads.json не найден")
+            return {'CANCELLED'}
+
+        photo_path = bpy.path.abspath(pba.photo_path)
+        if not photo_path or not os.path.exists(photo_path):
+            self.report({'ERROR'}, "Фото не задано или не существует")
+            return {'CANCELLED'}
+
+        transfers_dir = os.path.join(
+            os.path.dirname(layout_path), "transfers")
+        basename = os.path.splitext(os.path.basename(photo_path))[0]
+        transfer_png = os.path.join(transfers_dir, basename + ".png")
+        if not os.path.exists(transfer_png):
+            self.report(
+                {'ERROR'},
+                f"Transfer PNG не найден: {transfer_png}. "
+                f"Сначала Transfer This Photo.")
+            return {'CANCELLED'}
+
+        try:
+            with open(layout_path, 'r', encoding='utf-8') as f:
+                layout = json.load(f)
+        except Exception as e:
+            self.report({'ERROR'}, f"Layout: {e}")
+            return {'CANCELLED'}
+
+        try:
+            from PIL import Image
+            img = Image.open(transfer_png).convert("RGBA")
+            layout_arr = np.array(img)
+        except Exception as e:
+            self.report({'ERROR'}, f"Transfer PNG: {e}")
+            return {'CANCELLED'}
+
+        try:
+            created, skipped = viz_core.create_viz(
+                layout, layout_arr, scene, verbose=True)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Viz: {e}")
+            return {'CANCELLED'}
+
+        try:
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    for space in area.spaces:
+                        if space.type == 'VIEW_3D':
+                            space.shading.type = 'MATERIAL'
+                    area.tag_redraw()
+        except Exception:
+            pass
+
+        _set_status(scene,
+                    f"Viz: {created} объектов, {skipped} пропущено")
+        self.report({'INFO'}, f"Viz: {created} объектов")
+        return {'FINISHED'}
+
+
+class PBA_VM_OT_clear_visualization(bpy.types.Operator):
+    bl_idname = "pba_vm.clear_visualization"
+    bl_label = "Clear Visualization"
+    bl_description = ("Убрать временные viz-материалы и вернуть исходные "
+                      "слоты. Безопасно вызывать когда нечего очищать.")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            rm, ri = viz_core.clear_all_viz()
+        except Exception as e:
+            self.report({'ERROR'}, f"Clear: {e}")
+            return {'CANCELLED'}
+
+        _set_status(scene,
+                    f"Viz cleared: {rm} материалов, {ri} images")
+        self.report({'INFO'}, f"Очищено: {rm} мат, {ri} img")
+        return {'FINISHED'}
+
+
+classes += (
+    PBA_VM_OT_visualize_transfer,
+    PBA_VM_OT_clear_visualization,
 )

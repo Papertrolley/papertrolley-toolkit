@@ -114,14 +114,33 @@ classes = (PBA_VM_Correspondence, PBA_VM_Photo,
            PBA_VM_Props) + ops.classes + panel.classes
 
 
+def _on_load_post(*args):
+    """Auto-cleanup viz при открытии файла: .blend на диске не
+    содержит viz-состояния, даже если пользователь сохранил с
+    активной визуализацией."""
+    try:
+        from . import viz_core
+        rm, ri = viz_core.clear_all_viz()
+        if rm or ri:
+            print(f"[PBA VM] viz auto-cleanup on load: "
+                  f"{rm} materials, {ri} images removed")
+    except Exception as e:
+        print(f"[PBA VM] viz auto-cleanup failed: {e}")
+
+
 def register():
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.Scene.pba_vm = bpy.props.PointerProperty(type=PBA_VM_Props)
     ops.register_overlay()
 
+    if _on_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_on_load_post)
+
 
 def unregister():
+    if _on_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_on_load_post)
     ops.unregister_overlay()
     del bpy.types.Scene.pba_vm
     for c in reversed(classes):

@@ -150,6 +150,14 @@ class PBA_VM_PT_main(bpy.types.Panel):
         box.label(text="→ <layout_dir>/transfers/<photo>.png",
                   icon='INFO')
 
+        row = box.row(align=True)
+        row.operator("pba_vm.visualize_transfer",
+                     text="Visualize on Model", icon='MATERIAL')
+        row.operator("pba_vm.clear_visualization",
+                     text="Clear Viz", icon='X')
+        box.label(text="Только для проверки, в компоненты не пишет",
+                  icon='INFO')
+
         # Nudge
         box = layout.box()
         row = box.row()
