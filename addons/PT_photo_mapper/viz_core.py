@@ -11,7 +11,7 @@ import numpy as np
 import bpy
 
 
-VIZ_UV_SIZE = 1024
+VIZ_UV_SIZE = 2048
 VIZ_MATERIAL_PREFIX = "PT_Dbg_Viz_"
 VIZ_IMAGE_PREFIX = "PT_Dbg_Viz_"
 
@@ -49,8 +49,69 @@ def _group_islands(layout):
     return by_key
 
 
+def _sample_bilinear_premult(arr, lx, ly):
+    """Bilinear-сэмплирование layout RGBA в позициях (lx, ly).
+    Премультиплицированная альфа — не даёт тёмных ореолов на границах
+    островов. За пределами [0, W-1]×[0, H-1] возвращает alpha=0.
+
+    Возвращает (rgb [N,3] float32 0..255, alpha [N] float32 0..255)."""
+    H, W = arr.shape[:2]
+
+    # Пиксельные центры в (x+0.5, y+0.5). Для точки (lx, ly):
+    x0f = np.floor(lx - 0.5)
+    y0f = np.floor(ly - 0.5)
+    fx = lx - 0.5 - x0f
+    fy = ly - 0.5 - y0f
+
+    x0 = x0f.astype(np.int64)
+    y0 = y0f.astype(np.int64)
+    x1 = x0 + 1
+    y1 = y0 + 1
+
+    inside = (x0 >= 0) & (x1 < W) & (y0 >= 0) & (y1 < H)
+
+    x0c = np.clip(x0, 0, W - 1)
+    x1c = np.clip(x1, 0, W - 1)
+    y0c = np.clip(y0, 0, H - 1)
+    y1c = np.clip(y1, 0, H - 1)
+
+    p00 = arr[y0c, x0c].astype(np.float32)
+    p10 = arr[y0c, x1c].astype(np.float32)
+    p01 = arr[y1c, x0c].astype(np.float32)
+    p11 = arr[y1c, x1c].astype(np.float32)
+
+    p00_rgb = p00[:, :3] * (p00[:, 3:4] / 255.0)
+    p10_rgb = p10[:, :3] * (p10[:, 3:4] / 255.0)
+    p01_rgb = p01[:, :3] * (p01[:, 3:4] / 255.0)
+    p11_rgb = p11[:, :3] * (p11[:, 3:4] / 255.0)
+
+    fx_ = fx[:, None]
+    fy_ = fy[:, None]
+
+    rgb_top = p00_rgb * (1 - fx_) + p10_rgb * fx_
+    rgb_bot = p01_rgb * (1 - fx_) + p11_rgb * fx_
+    rgb_prem = rgb_top * (1 - fy_) + rgb_bot * fy_
+
+    a_top = p00[:, 3:4] * (1 - fx_) + p10[:, 3:4] * fx_
+    a_bot = p01[:, 3:4] * (1 - fx_) + p11[:, 3:4] * fx_
+    a = a_top * (1 - fy_) + a_bot * fy_
+
+    a_norm = a / 255.0
+    eps = 1e-6
+    rgb = np.clip(rgb_prem / np.maximum(a_norm, eps), 0, 255)
+
+    rgb[~inside] = 0
+    a[~inside] = 0
+
+    return rgb, a[:, 0]
+
+
 def bake_to_uv(layout, layout_arr, size):
-    """layout PNG → dict[(iid, obj_name, uv_map)] → (size, size, 4) uint8."""
+    """layout PNG → dict[(iid, obj_name, uv_map)] → (size, size, 4) uint8.
+
+    Backward mapping: для каждого UV-текселя вычисляется позиция в
+    layout через H⁻¹ и сэмплируется bilinear. Дырок нет — каждый
+    тексель внутри UV-острова получает цвет."""
     src_h, src_w = layout_arr.shape[:2]
     by_key = _group_islands(layout)
     results = {}
@@ -60,49 +121,62 @@ def bake_to_uv(layout, layout_arr, size):
         total_written = 0
 
         for isl in islands:
-            uv_pts = np.array(isl["corners_uv"][:4], dtype=np.float64)
-            layout_pts = np.array(isl["corners_layout_px"][:4],
+            corners_uv = np.array(isl["corners_uv"][:4],
                                    dtype=np.float64)
+            corners_layout = np.array(isl["corners_layout_px"][:4],
+                                       dtype=np.float64)
 
-            H = _compute_homography(layout_pts, uv_pts)
+            # layout px → UV (в [0,1]) — та же H, что и раньше
+            H = _compute_homography(corners_layout, corners_uv)
             if H is None:
                 continue
-
-            x0 = max(0, int(np.floor(layout_pts[:, 0].min())))
-            x1 = min(src_w - 1, int(np.ceil(layout_pts[:, 0].max())))
-            y0 = max(0, int(np.floor(layout_pts[:, 1].min())))
-            y1 = min(src_h - 1, int(np.ceil(layout_pts[:, 1].max())))
-            if x1 < x0 or y1 < y0:
+            try:
+                H_inv = np.linalg.inv(H)
+            except np.linalg.LinAlgError:
                 continue
 
-            yy, xx = np.mgrid[y0:y1 + 1, x0:x1 + 1]
-            px = xx.astype(np.float64).ravel() + 0.5
-            py = yy.astype(np.float64).ravel() + 0.5
-            n = len(px)
+            uv_min = corners_uv.min(axis=0)
+            uv_max = corners_uv.max(axis=0)
 
-            region = layout_arr[y0:y1 + 1, x0:x1 + 1, :]
-            colors = region.reshape(-1, 4)
-            has_content = colors[:, 3] > 0
-            if not has_content.any():
+            # UV bbox → диапазон текселей (с Y-flip: UV v=1 → ty=0)
+            tx0 = max(0, int(np.floor(uv_min[0] * size)))
+            tx1 = min(size - 1, int(np.ceil(uv_max[0] * size)))
+            ty0 = max(0, int(np.floor((1.0 - uv_max[1]) * size)))
+            ty1 = min(size - 1, int(np.ceil((1.0 - uv_min[1]) * size)))
+            if tx1 < tx0 or ty1 < ty0:
                 continue
 
-            v_h = np.stack([px, py, np.ones(n)], axis=0)
-            h = H @ v_h
+            yy, xx = np.mgrid[ty0:ty1 + 1, tx0:tx1 + 1]
+
+            # Центр текселя → UV-координата
+            u = (xx.astype(np.float64) + 0.5) / size
+            v = 1.0 - (yy.astype(np.float64) + 0.5) / size
+
+            n = u.size
+            u_flat = u.ravel()
+            v_flat = v.ravel()
+
+            v_h = np.stack(
+                [u_flat, v_flat, np.ones(n)], axis=0)
+            h = H_inv @ v_h
             w = h[2]
-            ok = (np.abs(w) > 1e-12) & has_content
+            ok_w = np.abs(w) > 1e-12
+            w_safe = np.where(ok_w, w, 1.0)
+            lx = h[0] / w_safe
+            ly = h[1] / w_safe
+
+            rgb, alpha = _sample_bilinear_premult(layout_arr, lx, ly)
+
+            ok = ok_w & (alpha > 0.5)
             if not ok.any():
                 continue
 
-            u = h[0, ok] / w[ok]
-            v = h[1, ok] / w[ok]
-
-            tx = np.clip((u * size).astype(np.int64), 0, size - 1)
-            ty = np.clip(((1.0 - v) * size).astype(np.int64),
-                          0, size - 1)
-
-            idx = np.where(ok)[0]
-            uv_tex[ty, tx] = colors[idx]
-            total_written += len(idx)
+            ty_flat = yy.ravel()[ok]
+            tx_flat = xx.ravel()[ok]
+            uv_tex[ty_flat, tx_flat, 0:3] = rgb[ok].astype(np.uint8)
+            uv_tex[ty_flat, tx_flat, 3] = np.clip(
+                alpha[ok], 0, 255).astype(np.uint8)
+            total_written += int(ok.sum())
 
         if total_written > 0:
             results[(iid, obj_name, uv_map)] = uv_tex
